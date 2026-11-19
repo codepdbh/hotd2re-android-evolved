@@ -36,8 +36,8 @@ android {
         applicationId providers.gradleProperty('hotd2ApplicationId').getOrElse(namespace)
         minSdk 29
         targetSdk 35
-        versionCode 1
-        versionName '0.1'
+        versionCode 2
+        versionName '1.0'
 
         ndk {
             abiFilters 'arm64-v8a'
@@ -56,6 +56,13 @@ android {
                 cmake {
                     // The APK is debuggable, but frame performance needs an optimized engine.
                     arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                }
+            }
+        }
+        release {
+            externalNativeBuild {
+                cmake {
+                    arguments '-DCMAKE_BUILD_TYPE=Release'
                 }
             }
         }

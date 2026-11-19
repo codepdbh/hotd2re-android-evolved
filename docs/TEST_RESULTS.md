@@ -31,3 +31,23 @@ Los registros de compilación y la salida de la prueba Vulkan se guardaron bajo 
 En una sesión posterior, ADB instaló el port e importó los 2045 archivos. Coincidieron los SHA-256 de `Hod2.exe`, `tex/common.bin` y `naomi_audio.bank` con la copia local. Se reconstruyó desde cero tras detectar objetos incrementales con dos tamaños distintos de `ExeImage`.
 
 El 19 de noviembre, `widescreen_test` comprobó la proyección, la puntería y la geometría de los seis capítulos. Vulkan generó capturas a 960 × 540 y 1170 × 540 del mismo fotograma de la primera fase. En un replay de prueba, el caso base llegó a Game Over. Al pulsar Start durante la cuenta regresiva, el mismo replay siguió en la primera fase con el jugador 1 activo y tres vidas. La APK con los controles Android se compiló. La verificación física de esta versión quedó pendiente al estar el teléfono fuera de ADB.
+
+Al reconectar el Galaxy S25 se instaló la versión panorámica y se inició la primera fase en **Ancho del teléfono**, a 2340 × 1080. Pasaron `gun_input_test`, `touch_guns_test` y las 396 comprobaciones de `pause_menu_test`. En la APK con iconos, se abrió el juego desde su nuevo icono en el lanzador de Samsung. Los controles exponen descripciones de accesibilidad y carecen de texto visible. Un toque en el cartucho devolvió la munición de cinco a seis balas. Dos toques en las mismas coordenadas pausaron y luego reanudaron la partida.
+
+## Multijugador online
+
+El Galaxy S25 recibió la lista del servidor y creó una sala por código. Antes de ajustar el redondeo, la conexión Android–Windows se desincronizó al comenzar Arcade. Al desactivar la fusión de multiplicaciones y sumas en Android, coincidieron los estados y las matrices de 2200 fotogramas en una repetición comparada con Windows. En una partida con el S25 como anfitrión y Windows x64 como invitado, ambos siguieron sincronizados por el relay hasta el fotograma 4000. Pasaron las 17 pruebas del servicio y los seis casos de conexión local, incluida la pérdida de los primeros mensajes del lobby.
+
+Con la última APK, el S25 se unió como P2 tras dejar abierto el teclado del juego más de ocho segundos y tocar el código de cinco dígitos de una sala de Windows. Se comprobó la pausa de P2 y la reanudación desde el mismo icono. El cartucho apareció durante la partida online. El teléfono se desconectó de ADB antes de comprobar la reposición de munición y la cuenta regresiva online.
+
+## Lanzador y pantalla completa
+
+La APK del nuevo lanzador se instaló en el S25 y conservó la importación existente y la selección **Ancho del teléfono**. Android presentó las opciones del lanzador y se observó el acceso directo al menú online. En el juego a 2340 × 1080, la captura y el estado de la ventana confirmaron que las barras de estado y navegación estaban ocultas.
+
+La misma APK se instaló en el Galaxy A55 (`SM-A556E`, Android API 36, ARM64). La primera importación empezó antes de terminar la transferencia y faltaba `tex`. Al repetirla con la transferencia completa, coincidieron los SHA-256 de los 2045 archivos en `h2evolved` y en la copia privada de la app. El juego inició con SDL_GPU y audio de baja latencia, entró online como P2 por conexión directa y mostró la primera fase con los controles táctiles.
+
+La APK bilingüe compiló y pasó la verificación de firma. Se comprobaron los 40 recursos localizados y el filtro de registros pasó 11 casos de entrada, incluidos errores del motor, códigos, direcciones y rutas privadas.
+
+En el S25, el lanzador cambió a inglés, conservó la selección al volver desde el juego y mostró en la vista previa el arranque del motor y los datos de Android.
+
+Para Android 1.0 pasaron la compilación y la tarea `lintVitalRelease`. Se verificaron el ABI ARM64, la versión mínima de Android 10, la firma v3 y la alineación de 16 KiB. El inventario de la APK confirmó las bibliotecas, las licencias y el descriptor de escena, sin archivos del juego de PC. Con una carpeta que contenía solo `Hod2.exe` y las siete carpetas de datos, el cliente de escritorio de HOTD2RE renderizó el fotograma 2300 de la primera fase.

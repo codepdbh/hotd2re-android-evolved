@@ -4,10 +4,14 @@ param(
     [string]$Jdk = $env:JAVA_HOME,
     [switch]$Offline,
     [switch]$WithTests,
-    [switch]$Game
+    [switch]$Game,
+    [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Release -and (!$Game -or $WithTests)) {
+    throw 'Use -Game -Release to build the unsigned game release.'
+}
 $root = Split-Path -Parent $PSScriptRoot
 if (!$Sdk) { $Sdk = $env:ANDROID_SDK_ROOT }
 if (!$Sdk) { $Sdk = Join-Path $env:LOCALAPPDATA 'Android/Sdk' }
@@ -22,8 +26,8 @@ foreach ($component in 'platforms/android-35/android.jar', 'build-tools/34.0.0/a
 if (!(Test-Path -LiteralPath (Join-Path $Jdk 'bin/javac.exe') -PathType Leaf)) {
     throw 'Pass -Jdk or set JAVA_HOME to a JDK between 17 and 22.'
 }
-$release = Get-Content -Raw -LiteralPath (Join-Path $Jdk 'release')
-if ($release -notmatch '(?m)^JAVA_VERSION="(17|18|19|20|21|22)([.+-]|")') {
+$jdkReleaseInfo = Get-Content -Raw -LiteralPath (Join-Path $Jdk 'release')
+if ($jdkReleaseInfo -notmatch '(?m)^JAVA_VERSION="(17|18|19|20|21|22)([.+-]|")') {
     throw 'Gradle 8.9 and AGP 8.7.3 need a JDK between 17 and 22. Pass -Jdk to select one.'
 }
 
@@ -54,7 +58,8 @@ try {
     $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
     $env:JAVA_HOME = (Resolve-Path -LiteralPath $Jdk).Path
     $module = if ($Game) { 'game' } else { 'app' }
-    $gradleArgs = @('-p', (Join-Path $root 'android'), '--no-daemon', '--console=plain', ":${module}:assembleDebug")
+    $variant = if ($Release) { 'Release' } else { 'Debug' }
+    $gradleArgs = @('-p', (Join-Path $root 'android'), '--no-daemon', '--console=plain', ":${module}:assemble${variant}")
     if ($WithTests) { $gradleArgs += ':app:assembleDebugAndroidTest' }
     if ($Offline) { $gradleArgs += '--offline' }
     # Windows PowerShell turns redirected native stderr into error records.
@@ -69,4 +74,5 @@ try {
     $env:JAVA_HOME = $savedJdk
 }
 
-Get-FileHash -LiteralPath (Join-Path $root "android/$module/build/outputs/apk/debug/$module-debug.apk")
+$artifact = if ($Release) { 'release/game-release-unsigned.apk' } else { "debug/$module-debug.apk" }
+Get-FileHash -LiteralPath (Join-Path $root "android/$module/build/outputs/apk/$artifact")

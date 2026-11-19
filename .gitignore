@@ -75,5 +75,7 @@ hotd2re_scores_pending.txt.lock
 *.bank
 *.wav
 *.keystore
+*.jks
+*.p12
 /hotd2re/
 /upstream/

@@ -1,5 +1,11 @@
 #pragma once
 
-// The Android UI posts a single Start edge during the continue countdown.
-void SetAndroidContinueVisible(bool visible);
-bool TakeAndroidContinueRequest();
+// These bits also identify the actions in GameActivity.
+enum AndroidControl : unsigned {
+    kAndroidContinue = 1u << 0,
+    kAndroidReload = 1u << 1,
+    kAndroidEscape = 1u << 2,
+};
+
+void SetAndroidAvailableControls(unsigned controls);
+unsigned TakeAndroidControlRequests();

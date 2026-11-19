@@ -23,6 +23,16 @@ final class GameDataImport {
 
     private GameDataImport() {}
 
+    static final class Failure extends IOException {
+        final int message;
+        final Object[] arguments;
+
+        Failure(int message, Object... arguments) {
+            this.message = message;
+            this.arguments = arguments;
+        }
+    }
+
     static boolean available(Path game) {
         try {
             validate(game);
@@ -33,7 +43,7 @@ final class GameDataImport {
     }
 
     static int copy(ContentResolver resolver, Uri tree, Path game, IntConsumer progress) throws IOException {
-        if (Files.exists(game)) throw new IOException("Ya existe una importación en el almacenamiento de la app.");
+        if (Files.exists(game)) throw new Failure(R.string.import_exists);
         Path staging = Files.createTempDirectory(game.getParent(), "game-import-");
         try {
             int count = copyChildren(resolver, tree, DocumentsContract.getTreeDocumentId(tree), staging, 0, progress);
@@ -49,13 +59,13 @@ final class GameDataImport {
                                     IntConsumer progress) throws IOException {
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parent);
         try (Cursor rows = resolver.query(children, COLUMNS, null, null, null)) {
-            if (rows == null) throw new IOException("Android no pudo leer una de las carpetas.");
+            if (rows == null) throw new Failure(R.string.import_unreadable_folder);
             while (rows.moveToNext()) {
                 String document = rows.getString(0);
                 String name = rows.getString(1);
                 if (name == null || name.isEmpty() || name.equals(".") || name.equals("..") || name.contains("/")
                         || name.contains("\\")) {
-                    throw new IOException("El proveedor devolvió un nombre de archivo inválido.");
+                    throw new Failure(R.string.import_invalid_name);
                 }
                 Path next = destination.resolve(name);
                 if (Document.MIME_TYPE_DIR.equals(rows.getString(2))) {
@@ -64,7 +74,7 @@ final class GameDataImport {
                 } else {
                     Uri resource = DocumentsContract.buildDocumentUriUsingTree(tree, document);
                     try (InputStream input = resolver.openInputStream(resource)) {
-                        if (input == null) throw new IOException("No se pudo abrir " + name);
+                        if (input == null) throw new Failure(R.string.import_unreadable_file, name);
                         Files.copy(input, next);
                     }
                     if (++count % 32 == 0) progress.accept(count);
@@ -76,26 +86,26 @@ final class GameDataImport {
 
     private static void validate(Path game) throws IOException {
         Path executable = game.resolve("Hod2.exe");
-        if (!Files.isRegularFile(executable)) throw new IOException("Falta Hod2.exe en la carpeta elegida.");
+        if (!Files.isRegularFile(executable)) throw new Failure(R.string.import_missing_exe);
         try (RandomAccessFile file = new RandomAccessFile(executable.toFile(), "r")) {
             if (file.length() < 0x200 || file.readUnsignedShort() != 0x4d5a) {
-                throw new IOException("Hod2.exe no tiene una cabecera PE válida.");
+                throw new Failure(R.string.import_invalid_header);
             }
             file.seek(0x3c);
             long header = Integer.toUnsignedLong(Integer.reverseBytes(file.readInt()));
             if (header < 0x40 || header > file.length() - 26) {
-                throw new IOException("Hod2.exe tiene un desplazamiento de cabecera inválido.");
+                throw new Failure(R.string.import_invalid_offset);
             }
             file.seek(header);
-            if (file.readInt() != 0x50450000) throw new IOException("Hod2.exe no tiene una firma PE válida.");
+            if (file.readInt() != 0x50450000) throw new Failure(R.string.import_invalid_signature);
             file.seek(header + 24);
-            if (file.readUnsignedShort() != 0x0b01) throw new IOException("Se requiere Hod2.exe de 32 bits para PC.");
+            if (file.readUnsignedShort() != 0x0b01) throw new Failure(R.string.import_wrong_arch);
         }
         for (String dir : new String[]{"cam", "coli", "evt", "mot", "pol", "tex"}) {
-            if (!Files.isDirectory(game.resolve(dir))) throw new IOException("Falta la carpeta " + dir + ".");
+            if (!Files.isDirectory(game.resolve(dir))) throw new Failure(R.string.import_missing_folder, dir);
         }
         if (!Files.isDirectory(game.resolve("sound")) && !Files.isDirectory(game.resolve("Sound"))) {
-            throw new IOException("Falta la carpeta de audio del juego.");
+            throw new Failure(R.string.import_missing_sound);
         }
     }
 

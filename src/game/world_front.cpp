@@ -118,6 +118,12 @@ void World::ForceMode(int mode, uint32_t nextSerial, uint32_t randState, int dem
     w.front.demoIndex = demoIndex;
 }
 
+void World::RequestOnlineLobby() {
+    Impl& w = *impl_;
+    w.front.modeRequest = 15;
+    w.FrontApplyMode();
+}
+
 // Game_Update 0x0040E730 (the AUTORELOAD joins 0x007C17AC are off)
 void World::Impl::FrontStep() {
     ++frame;

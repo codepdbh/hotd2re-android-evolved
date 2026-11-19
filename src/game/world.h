@@ -538,6 +538,7 @@ public:
     // away, as ForceMode does; the next Step() runs the title's init frame. A world without the front end (StartStage)
     // only gets the mode switch. The caller stops the sounds (Snd_StopAll 0x0041D350) itself.
     void RequestTitle();
+    void RequestOnlineLobby();
     // Port only: the current volume settings (0..10 each) for the options screen's volume rows (WorldConfig::portVolumes),
     // e.g. after the pause menu changed them.
     void SetPortVolumes(const int v[5]);

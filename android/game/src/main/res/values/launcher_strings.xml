@@ -1,0 +1,46 @@
+<resources>
+    <string name="launcher_play">Jugar</string>
+    <string name="launcher_online">Online</string>
+    <string name="launcher_settings">Configuración</string>
+    <string name="launcher_language">Idioma del lanzador</string>
+    <string name="launcher_format">Formato de pantalla</string>
+    <string-array name="launcher_formats">
+        <item>Clásico (4:3)</item>
+        <item>Panorámico (16:9)</item>
+        <item>Ancho del teléfono</item>
+    </string-array>
+    <string name="launcher_sound">Sonido del juego</string>
+    <string name="launcher_data">Datos del juego</string>
+    <string name="launcher_ready">Listos para jugar</string>
+    <string name="launcher_needs_data">Importa la carpeta que contiene Hod2.exe.</string>
+    <string name="launcher_import">Importar carpeta del juego</string>
+    <string name="launcher_online_help">Cómo jugar online</string>
+    <string name="launcher_code_title">Jugar por código</string>
+    <string name="launcher_code_help">En el primer teléfono, abre Online → Peer to Peer → Host. Deja la sala abierta.\n\nEn el segundo, abre Online → Peer to Peer → Join y toca los cinco dígitos del código en el juego.</string>
+    <string name="launcher_ok">Entendido</string>
+    <string name="launcher_no_picker">El teléfono no dispone de selector de carpetas.</string>
+    <string name="launcher_copying">Copiando los datos al almacenamiento privado de la app…</string>
+    <string name="launcher_copied">Archivos copiados: %1$d</string>
+    <string name="launcher_import_error">No se pudieron importar los datos.</string>
+    <string name="launcher_scene_error">No se pudo preparar la escena de inicio.</string>
+    <string name="import_exists">Ya existe una importación en el almacenamiento de la app.</string>
+    <string name="import_unreadable_folder">Android no pudo leer una de las carpetas.</string>
+    <string name="import_invalid_name">El proveedor devolvió un nombre de archivo inválido.</string>
+    <string name="import_unreadable_file">No se pudo abrir %1$s.</string>
+    <string name="import_missing_exe">Falta Hod2.exe en la carpeta elegida.</string>
+    <string name="import_invalid_header">Hod2.exe no tiene una cabecera PE válida.</string>
+    <string name="import_invalid_offset">Hod2.exe tiene un desplazamiento de cabecera inválido.</string>
+    <string name="import_invalid_signature">Hod2.exe no tiene una firma PE válida.</string>
+    <string name="import_wrong_arch">Se requiere Hod2.exe de 32 bits para PC.</string>
+    <string name="import_missing_folder">Falta la carpeta %1$s.</string>
+    <string name="import_missing_sound">Falta la carpeta de audio del juego.</string>
+    <string name="report_option">Enviar registros a GitHub</string>
+    <string name="report_title">Revisar registros</string>
+    <string name="report_instruction">Revisa el contenido antes de abrir el borrador. La incidencia será pública si la envías desde GitHub.</string>
+    <string name="report_open">Abrir GitHub</string>
+    <string name="report_copy">Copiar</string>
+    <string name="report_copied">Informe copiado</string>
+    <string name="report_no_browser">No hay un navegador disponible. Puedes copiar el informe.</string>
+    <string name="report_issue_title">Error en Android Evolved</string>
+    <string name="report_issue_intro">### Qué pasó\n\nDescribe el error y los pasos para reproducirlo.</string>
+</resources>

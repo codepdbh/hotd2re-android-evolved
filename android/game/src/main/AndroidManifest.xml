@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature android:name="android.hardware.vulkan.version"
         android:version="0x00400000" android:required="true" />
     <application android:label="The House of the Dead 2 — Android Evolved" android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
         android:theme="@android:style/Theme.Material.NoActionBar" android:enableOnBackInvokedCallback="false">
         <activity android:name=".DataActivity" android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">

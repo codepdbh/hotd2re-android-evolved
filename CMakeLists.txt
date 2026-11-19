@@ -77,6 +77,11 @@ endif()
 
 # Rewritten game code shared by the hook DLL and the port.
 add_library(game STATIC src/game/prs.cpp src/game/texture.cpp src/game/exe_image.cpp src/game/palette_bank.cpp src/game/model.cpp src/game/anim.cpp src/game/camera.cpp src/game/event.cpp src/game/stage.cpp src/game/environment.cpp src/game/sprite.cpp src/game/shooting.cpp src/game/enemy.cpp src/game/rng.cpp src/game/effects.cpp src/game/task.cpp src/game/props.cpp src/game/event_runner.cpp src/game/skin.cpp src/game/shoot_camera.cpp src/game/mstack.cpp src/game/world.cpp src/game/world_enemy.cpp src/game/world_enemy_ai.cpp src/game/world_civilian.cpp src/game/world_player.cpp src/game/world_gameover.cpp src/game/world_actors.cpp src/game/world_collision.cpp src/game/world_scene1.cpp src/game/world_st2.cpp src/game/world_st2_actors.cpp src/game/world_st2_enemy.cpp src/game/world_st2_actor31.cpp src/game/world_st2_bats.cpp src/game/world_st2_komono.cpp src/game/world_st2_misc.cpp src/game/world_npc.cpp src/game/world_st1b.cpp src/game/world_routes.cpp src/game/world_plan.cpp src/game/world_routes_fish.cpp src/game/world_st1b_bats.cpp src/game/world_st1b_held.cpp src/game/world_st1b_civ.cpp src/game/world_st1b_boss.cpp src/game/world_enemy_beh.cpp src/game/menu_text.cpp)
+if(ANDROID)
+  # Match the separate multiply and add rounding of the Windows game build.
+  # Netplay compares simulation state, including the exact matrix bits.
+  target_compile_options(game PRIVATE -ffp-contract=off)
+endif()
 target_sources(game PRIVATE src/game/world_st3.cpp src/game/world_st3_actors.cpp src/game/world_st3_enemy.cpp src/game/world_st3_fish.cpp src/game/world_st3_vehicle.cpp src/game/world_st3_birds.cpp)  # stage 3 (notes/agents/stage3.md)
 target_sources(game PRIVATE src/game/world_st3_boss.cpp)  # stage-3 boss, continues (notes/agents/stage3b.md)
 target_sources(game PRIVATE src/game/naomi_math.cpp)

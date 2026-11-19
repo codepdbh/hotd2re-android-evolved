@@ -833,6 +833,7 @@ int main(int argc, char** argv) {
     uint32_t firstSerial = 0x10000;  // the play captures: 65551 (history-dependent)
     int credits = -1;                // -1: free play; else that many credits (the play captures: 5)
     bool direct = false;             // --direct: start a game at once (no boot / title / mode select)
+    bool openOnline = false;
     bool typingMode = false;
     std::string configPath;          // --config: a mid-game stage start (WorldConfig + carry from world_test --save-config)
     std::string settingsOverride;    // explicit isolated settings file, also usable by screenshot comparisons
@@ -914,6 +915,8 @@ int main(int argc, char** argv) {
             credits = atoi(argv[++i]);
         else if (a == "--direct")
             direct = true;
+        else if (a == "--online")
+            openOnline = true;
         else if (a == "--typing") {
             typingMode = true;
             direct = true;
@@ -1341,6 +1344,7 @@ int main(int argc, char** argv) {
         if (screenshot.empty() || saveGiven) boot.savePath = savePath;
         boot.savePatch = savePatch;
         world.Boot(boot);
+        if (openOnline && !netplay) world.RequestOnlineLobby();
         return true;
     };
     auto startNetworkGame = [&] {
@@ -2048,12 +2052,20 @@ int main(int argc, char** argv) {
     double scoreSubmissionNoticeUntil = 0;
     bool active = true;  // focus gates local input and the system cursor, never the game clock or audio
 #ifdef __ANDROID__
-    bool androidContinueVisible = false;
-    auto androidMayContinue = [&] {
+    unsigned androidAvailableControls = 0;
+    auto androidControls = [&]() -> unsigned {
         const auto& h = world.Hud();
-        return !headless && active && !netplay && !menu.IsOpen() && !h.paused && h.gameMode == 6 &&
-               (h.flags5900 & 2u) && h.player[0].state == 4 &&
-               (h.continueShown >= 0 || h.player[0].continueShown >= 0);
+        if (headless || !active || h.gameMode != 6 || usernamePrompt.IsOpen() || updatePrompt.IsOpen() ||
+            networkDesync.Active() || net.CatchingUp() || net.ReplayPending())
+            return 0;
+        if (h.paused) return kAndroidEscape;
+        if (menu.IsOpen() || optionsPage.IsOpen() || modelGallery.IsOpen() || h.stageResults.active) return 0;
+        const auto& player = h.player[keyboardPlayer()];
+        if ((h.flags5900 & 2u) && player.state == 4 && (h.continueShown >= 0 || player.continueShown >= 0))
+            return kAndroidContinue;
+        if (h.subState == 2 && player.state == 5 && (h.flags5900 & 0x1Cu) == 0)
+            return kAndroidReload | kAndroidEscape;
+        return 0;
     };
 #endif
     auto feedbackContext = [&](bool stalled = false, bool replay = false) {
@@ -2799,7 +2811,12 @@ int main(int argc, char** argv) {
                 !feedbackPage.IsOpen() && !controllerPage.IsOpen() && !wiiPage.IsOpen() && !lightgunPage.IsOpen() && !modelGallery.IsOpen() &&
                 play::ScoreDisplayCode::FrontEnd(world.GameMode(), world.Hud().nightShiftPage);
             const auto scoreInput = scoreDisplay.Update(g_keys, scoreCodeEligible);
-            const uint32_t frameKeys = scoreInput.keys;
+            uint32_t frameKeys = scoreInput.keys;
+#ifdef __ANDROID__
+            const unsigned androidRequests = TakeAndroidControlRequests() & androidControls();
+            // Keep the pulse in this simulation frame, even if Android already delivered key up.
+            if (!namePromptWasOpen && (androidRequests & kAndroidEscape)) frameKeys |= play::kEscapeKey;
+#endif
             if (scoreInput.toggled) scoreNoticeUntil = frame + 150;
             const uint32_t scriptedKeyEdges = frameKeys & ~menuPrevKeys;
             int menuPausePlayer = 0;
@@ -3530,8 +3547,7 @@ int main(int argc, char** argv) {
                             why = "THAT ROOM IS FULL";
                         else if (jr == port::net::JoinResult::OtherVersion)
                             why = "THE HOST RUNS ANOTHER VERSION";
-                        else if (jr == port::net::JoinResult::NoAnswer ||
-                                 (jr == port::net::JoinResult::Pending && net.LobbySilence() > 6.0))
+                        else if (jr == port::net::JoinResult::NoAnswer)
                             why = "NO ANSWER FROM THE LOBBY SERVER";
                         else if (jr == port::net::JoinResult::TimedOut)
                             why = "THE HOST IS NO LONGER AVAILABLE";
@@ -3641,9 +3657,18 @@ int main(int argc, char** argv) {
                 typingCancel[p] = false; typingItems[p] = 0; typingButtons[p] = 0;
             }
 #ifdef __ANDROID__
-            if (TakeAndroidContinueRequest() && androidMayContinue() && !menuWasOpen && !pageWasOpen) {
-                in[0].pressed |= KeyBit(platform::Key::Enter);
-                netPresent[0] = true;
+            if (!menuWasOpen && !pageWasOpen && !namePromptWasOpen) {
+                const int p = keyboardPlayer();
+                if (androidRequests & kAndroidContinue) {
+                    in[p].pressed |= KeyBit(platform::Key::Enter);
+                    netPresent[p] = true;
+                }
+                if (androidRequests & kAndroidReload) {
+                    in[p].pressed |= KeyBit(platform::Key::Backspace);
+                    in[p].offscreen = true;
+                    in[p].fired = false;
+                    netPresent[p] = true;
+                }
             }
 #endif
             if (!netplay)
@@ -3951,10 +3976,10 @@ int main(int argc, char** argv) {
             for (const auto& s : sounds) game::PlaySoundEvent(*sndDriver, sndTable, s);
         play::ApplyModelGalleryAudio(modelGallery,sndDriver.get(),sndTable);
 #ifdef __ANDROID__
-        const bool showAndroidContinue = androidMayContinue();
-        if (showAndroidContinue != androidContinueVisible) {
-            SetAndroidContinueVisible(showAndroidContinue);
-            androidContinueVisible = showAndroidContinue;
+        const unsigned controls = androidControls();
+        if (controls != androidAvailableControls) {
+            SetAndroidAvailableControls(controls);
+            androidAvailableControls = controls;
         }
 #endif
         // Gate transitions even when a network wait or menu action skipped the simulation tick above.

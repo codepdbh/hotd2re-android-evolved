@@ -1,0 +1,46 @@
+<resources>
+    <string name="launcher_play">Play</string>
+    <string name="launcher_online">Online</string>
+    <string name="launcher_settings">Settings</string>
+    <string name="launcher_language">Launcher language</string>
+    <string name="launcher_format">Display format</string>
+    <string-array name="launcher_formats">
+        <item>Classic (4:3)</item>
+        <item>Widescreen (16:9)</item>
+        <item>Full phone width</item>
+    </string-array>
+    <string name="launcher_sound">Game audio</string>
+    <string name="launcher_data">Game data</string>
+    <string name="launcher_ready">Ready to play</string>
+    <string name="launcher_needs_data">Import the folder that contains Hod2.exe.</string>
+    <string name="launcher_import">Import game folder</string>
+    <string name="launcher_online_help">How to play online</string>
+    <string name="launcher_code_title">Play with a room code</string>
+    <string name="launcher_code_help">On the first phone, open Online → Peer to Peer → Host. Leave the room open.\n\nOn the second phone, open Online → Peer to Peer → Join and tap the five digits in the game.</string>
+    <string name="launcher_ok">Got it</string>
+    <string name="launcher_no_picker">This phone has no folder picker.</string>
+    <string name="launcher_copying">Copying the game data into the app’s private storage…</string>
+    <string name="launcher_copied">Files copied: %1$d</string>
+    <string name="launcher_import_error">Could not import the game data.</string>
+    <string name="launcher_scene_error">Could not prepare the starting scene.</string>
+    <string name="import_exists">Game data has already been imported into the app.</string>
+    <string name="import_unreadable_folder">Android could not read one of the folders.</string>
+    <string name="import_invalid_name">The file provider returned an invalid file name.</string>
+    <string name="import_unreadable_file">Could not open %1$s.</string>
+    <string name="import_missing_exe">Hod2.exe is missing from the selected folder.</string>
+    <string name="import_invalid_header">Hod2.exe does not have a valid PE header.</string>
+    <string name="import_invalid_offset">Hod2.exe has an invalid header offset.</string>
+    <string name="import_invalid_signature">Hod2.exe does not have a valid PE signature.</string>
+    <string name="import_wrong_arch">A 32-bit PC copy of Hod2.exe is required.</string>
+    <string name="import_missing_folder">The %1$s folder is missing.</string>
+    <string name="import_missing_sound">The game audio folder is missing.</string>
+    <string name="report_option">Send logs to GitHub</string>
+    <string name="report_title">Review logs</string>
+    <string name="report_instruction">Review the report before opening the draft. The issue will be public if you submit it on GitHub.</string>
+    <string name="report_open">Open GitHub</string>
+    <string name="report_copy">Copy</string>
+    <string name="report_copied">Report copied</string>
+    <string name="report_no_browser">No browser is available. You can copy the report.</string>
+    <string name="report_issue_title">Android Evolved bug report</string>
+    <string name="report_issue_intro">### What happened\n\nDescribe the issue and the steps to reproduce it.</string>
+</resources>
