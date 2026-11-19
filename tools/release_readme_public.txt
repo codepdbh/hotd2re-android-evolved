@@ -1,0 +1,173 @@
+The House of the Dead 2 - native port (hotd2-re)
+=================================================
+
+Release {{RELEASE_VERSION}} (Windows {{ARCHITECTURE}}).
+Release notes: https://github.com/GitFist/hotd2-re/releases/tag/v2026.11.10-a
+Complete download: HOTD2RE-2.3-Windows-x64.zip
+This folder contains the port and any accompanying redistributable runtime components. It needs your own copy of the game.
+
+1. Install The House of the Dead 2 (PC, 2001) from your disc, or locate an existing installation
+   (the folder with Hod2.exe and its data folders).
+2. Copy EVERYTHING from that installation folder into the "game" folder here, so that you have:
+     hotd2re\game\Hod2.exe
+     hotd2re\game\tex\ ... pol\ ... evt\ ... Sound\ ... (all the game's folders)
+3. Double-click hotd2.exe. The original CD is not needed by the port.
+
+Controls (mouse / touchpad / light gun): left button = trigger, right button = reload, middle button or Enter = start.
+Xbox/PlayStation controllers: configure each player in Options > Devices > Controllers.
+LB/L1 and RB/R1 switch settings categories; A/Cross selects and B/Circle goes back.
+Options > Devices > Feedback enables saved per-player controller rumble and light-gun
+recoil for OpenFIRE, GUN4IR, Blamcon, or Sinden through its driver. Outputs start Off.
+Select Test shot or Test damage to check your setup. Physical gun feedback still needs
+hardware testing; keep required tracking software running.
+Keyboard in menus: arrows, Enter (confirm), Esc / Backspace (back). Esc pauses/resumes during play and never quits.
+Score display: at the title or main menu, press Left, Left, Right, Right, Right,
+Left, Right, Enter. Repeat to turn it off. The setting lasts until you close the game.
+Each active player's score appears during gameplay; scoring and rankings are unchanged.
+The pause menu has volume and Graphics Options settings. Settings are kept in hotd2re_settings.ini,
+your rankings in hotd2re_save.bin (both created here).
+Touchpad users: if clicks do nothing in the game, open hotd2re_settings.ini and set  input=mouse
+
+NIGHT SHIFT
+The Home page uses the game's live standby preview. Play contains Arcade, Original,
+Boss Mode (time attack), Challenges, Horde and Randomizer. Practice contains Scene
+Select. Challenges is the former Training mode, with objective captions for each challenge.
+Boss Mode is a scored time attack, not a practice mode.
+Options opens graphics shortcuts and Game Options. Display > Menu Style selects Night Shift
+or Classic for the next launch. Existing campaign rules and saves are retained.
+Menus stay sharp at display resolution independently of gameplay render scale. Faded edges
+and scroll indicators show when more list items are available above or below.
+Extras includes all 38 named music tracks, effects/dialogue previews, and a model viewer.
+Master volume has a gradual scale with quieter low levels. Attraction volume controls the
+background menu loop separately from gameplay music, gunfire and effects.
+
+THE TYPING OF THE DEAD
+Use the other game's logo card on the main menu to switch games. Typing has its own
+moving attract presentation, Original campaign, all 13 Drill courses, leaderboard and
+options. Original setup includes difficulty, lives, continues, word size and US/UK
+keyboard layout. Type the displayed words to fight. Drill uses authored encounters,
+word cards, result books and course records, and is local play. Typing Original can
+also be selected in the shared two-player online lobby.
+
+UPDATING AN EXISTING INSTALLATION
+Close the game and extract the ENTIRE new runtime ZIP into a fresh writable folder.
+Keep its executable, all accompanying DLLs, notices and scenes together; replacing only
+hotd2.exe can leave incompatible older runtimes installed. Copy your existing game folder
+into the new hotd2re folder, along with hotd2re_settings.ini and hotd2re_save.bin. Also copy
+hotd2re_horde_records.txt, hotd2re_lightguns.ini and hotd2re_wii.ini if present, plus any
+installed visual-pack folders selected by your settings. Keep the old folder as a backup
+until the new version works. Both online players should update together and create a new room.
+Never give your private hotd2re_rejoin.bin ticket to another player.
+
+Normal hotd2.exe launches enable sound, including custom game paths/options. Switching
+windows keeps gameplay and sound running; use Esc to pause manually when needed.
+Normal launches check the official GitHub release page once in the background. A newer
+version offers Update now, Download, or Later at the local title/main menu. Update now
+opens a visible progress window, closes the game, downloads and verifies the matching
+Windows version, replaces its program files, and reopens it. Saves, settings, controller
+calibration, original game data and installed packs are kept. Failed installations
+restore the previous program files; an interrupted update is recovered on next launch.
+Keep the .hotd2-update folder if recovery needs another attempt. A writable local game
+folder and Windows PowerShell are required. --no-update-check disables the check.
+Updates reuse unchanged files and download only changed program files. A verified
+full-client fallback is available automatically; update files need no manual download.
+Client-only updates do not include the Typing data. If it is missing, startup downloads
+it once (89.5 MB), with verification, progress and Cancel. The complete {{RELEASE_VERSION}} ZIP
+already includes it; the original Typing executable is not run. --no-update-check
+also skips this automatic content download.
+Version 1.1 is the baseline for future in-game updates. Older date-labeled builds and
+32-bit installations need one manual installation of the latest complete x64 package.
+Version 1.0 x64 can update through its selective path; if that fails, install manually.
+Follow the migration steps above to keep saves, settings, calibration and packs.
+
+ONLINE TWO-PLAYER
+Open Home > Online for Create Room, Browse Lobby and Peer to Peer.
+The Home waiting-room preview also lets you join listed rooms. Classic uses mode select > Network.
+  Create Room - choose the game, Unlimited Continues (or 3 continues) and Private Room.
+                 A private room shows a 5-digit code to give your friend. When someone joins,
+                 both players enter the shared mode-selection lobby.
+  Browse Lobby - view open rooms and choose one; a private room asks for its code.
+                 Listings show advertised difficulty; older hosts can show Unknown.
+  Peer to Peer - Host shows a 5-digit code; your friend picks Join and enters it. Unlisted.
+The host (player 1) chooses Arcade, Original, Scene Selection, Boss Mode, Horde Mode,
+Randomizer, or Typing Original. Pause > Return to Lobby brings both
+players back to the same room. Esc pauses/resumes and Enter confirms. Either player can resume a pause.
+The host can change difficulty in the shared lobby; both players use that setting.
+Chapter results stay open until a click, shot, or Enter after a three-second minimum; either player can continue.
+Close the window or use Home > Exit to quit. Both players need the same version (shown on Network).
+Connections try direct first and automatically use the server relay when needed; no port forwarding is required.
+After a disconnect the other player keeps playing. Reopen the same folder and choose Network > Rejoin Game.
+Keep your private hotd2re_rejoin.bin ticket in that folder; do not share it.
+
+LEADERBOARD
+Home > Leaderboard shows Arcade, Original, Horde, individual Boss Mode and Typing tables.
+Typing Home opens its table directly; Drill course records stay in Drill.
+Source: Local reads your own records. Source: Online is the shared service view.
+Shared records are unverified, self-reported scores rather than anti-cheat rankings.
+Choose a public username on first launch (1-12 characters). Eligible finished runs
+submit automatically. Change your name in Options > Gameplay > Username; previous
+and queued runs keep their original name. Type or use the on-screen keyboard.
+Letters, numbers, spaces, periods, underscores and hyphens are supported. Names
+are display names, not unique accounts. Local initials stay three characters.
+Offline scores are saved and retried quietly, including after restarting, without
+duplicate submissions. Keep hotd2re_scores_pending.txt with your settings. Existing
+save records are not uploaded. Local records work offline.
+
+GRAPHICS AND DISPLAY
+Options and Pause > Options provide Display, Graphics, Gameplay, Sound, Devices
+and CRT categories. Image Preset > Original,
+Clean and Enhanced change image choices and downsampling, not every graphics setting.
+Fullscreen includes borderless and exclusive choices. Resolution includes authored
+scale, match-output and 150%/200% output-relative SSAA. Higher settings cost GPU time
+and memory. Calibration cards help inspect black level, white, gamma and geometry.
+Render Scale 2x/3x/4x draws more pixels at runtime.
+Experimental widescreen can reveal original off-camera staging. Optional render-pose
+interpolation smooths presentation above 60 FPS with up to one tick of visual delay;
+gameplay remains at 60 Hz and aiming/HUD input remains immediate.
+
+Display > Reset All Graphics asks for confirmation and saves graphics defaults. It keeps
+the menu theme, game rules, audio and controls. Some changes need restart.
+Night Shift's Display > Menu Opacity changes background strength while text stays readable;
+Classic labels it Night Shift only. During paused graphics changes, Hide UI or H reveals
+the actual scene without resuming. H, Show UI, Back/Reload, Enter or Start restores the UI.
+Image > Gameplay Crosshairs > Off hides both players' gameplay sights locally. Menu, shop
+and calibration pointers remain visible; aiming and shooting are unchanged. The system
+'+' pointer also hides automatically in gameplay and returns for UI/desktop use.
+Color > Blood Color switches Green/Red immediately and saves locally; online players
+choose independently.
+
+Direct3D 11 and SDL_GPU offer the broad optional raster-effects paths. Native Direct3D 12
+on Windows x64 enables supported vendor temporal reconstruction/frame generation and
+experimental directional DXR shadows. Options are checked against the active backend
+and GPU; every backend does not support every effect. Renderer, vendor reconstruction,
+frame generation and menu style require restart. Unavailable
+SDK/GPU features report a fallback instead of pretending to run the selected effect.
+Advanced effects, DXR, frame generation and HDR are optional and Off by default.
+HDR uses linear scRGB and requires Windows HDR; original art retains its SDR range.
+No original game assets or vendor SDK source are included here.
+
+DEVICE SETUP
+Options > Devices > Light Guns or Wii Remotes opens native setup; both are also on
+Pause. Classic retains Options > Light Guns / Wii Remotes. Light Guns assigns each gun,
+captures bindings, calibrates aim and tests both players. Online players configure their
+local gun as Player 1. Keep any required light-gun border enabled.
+Wii Remotes supports a powered sensor bar with compatible Bluetooth, or DolphinBar Mode 4.
+Connect and sync, then use Player 1/2 setup for calibration and controls. B fires, A reloads,
++ confirms and HOME pauses by default. Calibration always uses four fresh B presses.
+Physical light-gun/Wii pairing and aiming remain unverified; automated device tests pass.
+
+RANDOMIZER
+Choose Play > Randomizer or use the shared online lobby. Ordinary zombies and group
+sizes vary while bosses, rescues and scripted encounters retain their roles. Each
+chapter rolls weapons and compatible bonuses; pickups equip immediately. Recorded
+dialogue and character appearances vary consistently with the run seed. Both PCs use
+the same seed. Original-mode inventory, unlocks and high scores are preserved.
+
+BUILD.txt identifies the actual executable architecture/build label. PACKAGE-MANIFEST.json
+records payload hashes, runtime notices and any reviewed vendor-byte privacy exceptions.
+SHA256SUMS.txt also hashes the manifest; the adjacent .zip.sha256 hashes the archive.
+
+NAOMI GRAPHICS
+Naomi is the default graphics profile; Options > Graphics > Graphics mode also
+offers PC graphics. The first normal launch downloads missing Naomi data once,
+with visible progress and verification. Saved graphics preferences are preserved.

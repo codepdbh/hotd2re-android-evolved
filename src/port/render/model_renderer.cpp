@@ -1,0 +1,1416 @@
+#include "model_renderer.h"
+#include "mesh_refinement.h"
+#include "naomi_flash_sort.h"
+#include "naomi_vertex_lighting.h"
+
+#include "game/crt_qsort.h"
+#include "game/anim.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace port {
+
+namespace {
+
+// Opt-in diagnostic fixture, independent of C++ padding/ABI. All integers and
+// IEEE float bits are little endian; NSORT003 retains the unculled triangles
+// plus each source's actual clip projection/cull and conservative guard band.
+bool WriteNaomiSortFixture(const char* path,const std::vector<NaomiFlashTriangle>& triangles,
+                          const GpuDrawList& list,const std::vector<size_t>& draws,float guardX,float guardY) {
+    auto* file=std::fopen(path,"wb");if(!file)return false;
+    bool ok=std::fwrite("NSORT003",1,8,file)==8;
+    const auto word=[&](uint64_t value,unsigned bytes) {
+        unsigned char data[8];for(unsigned k=0;k<bytes;++k)data[k]=static_cast<unsigned char>(value>>(8*k));
+        ok=std::fwrite(data,1,bytes,file)==bytes && ok;
+    };
+    const auto values=[&](const float* data,size_t count) {
+        for(size_t i=0;i<count;++i){uint32_t bits;std::memcpy(&bits,data+i,4);word(bits,4);}
+    };
+    word(triangles.size(),4);
+    word(draws.size(),4);values(&guardX,1);values(&guardY,1);
+    for(size_t index:draws){word(index,4);values(list.model[list.draws[index].constants].projection,16);word(list.draws[index].state.cull,4);}
+    for(const auto& triangle:triangles) {
+        word(triangle.sourceDraw,4);word(triangle.sequence,8);word(triangle.additive?1:0,4);
+        for(const auto& v:triangle.vertices) {
+            values(v.pos,3);values(v.normal,3);values(v.uv,2);values(v.color,3);values(v.specular,3);
+        }
+    }
+    return std::fclose(file)==0 && ok;
+}
+
+// Row-vector matrices (HLSL mul(v, M)), left-handed, matching the offline renderer's camera.
+void Multiply(const float a[16], const float b[16], float out[16]) {
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c) {
+            float s = 0;
+            for (int k = 0; k < 4; ++k) s += a[r * 4 + k] * b[k * 4 + c];
+            out[r * 4 + c] = s;
+        }
+}
+
+float MaxAxisScale(const float t[16]) {
+    float s = 0;
+    for (int r = 0; r < 3; ++r) s = std::max(s, std::sqrt(t[r * 4] * t[r * 4] + t[r * 4 + 1] * t[r * 4 + 1] + t[r * 4 + 2] * t[r * 4 + 2]));
+    return s;
+}
+
+// Original Naomi standard kernel's BRAF dispatch at 0x0C0C266E.
+// The native table deliberately has the same q^10 route for indices 5 and 6;
+// material index 16 selects q^32, other indices above 8 select q^64.
+float NaomiSpecularPower(int index) {
+    static constexpr float powers[] = {0,2,4,6,8,10,10,14,16};
+    if (index < 0) return -1; // -1 selects the constant-intensity kernel
+    if (index <= 8) return powers[index];
+    return index == 16 ? 32.f : 64.f;
+}
+
+// Native 0x0C069A2E packs the first eight significand bits and exponent
+// (IEEE exponent -126). FOG_DENSITY therefore represents approximately 2*far.
+float NaomiFogDensity(float far) {
+    if (!(far>0) || !std::isfinite(far)) return 0;
+    int exponent=0;
+    const float mantissa=std::frexp(far,&exponent);
+    const float byte=std::floor(mantissa*256.f);
+    if (exponent<0) return std::floor(std::ldexp(byte,exponent))/128.f;
+    if (exponent>126) return 0;
+    return std::ldexp(byte/128.f,exponent);
+}
+
+// Like IDirect3DDevice7::ComputeSphereVisibility's D3DSTATUS_CLIPINTERSECTION* bits (0xFFF000), which Mdl_Draw tests:
+// true when the sphere lies completely outside one of the six clip planes (row-vector world->clip matrix).
+bool SphereOutside(const float m[16], const float c[3], float r, bool meshTest, float zNear) {
+    // Mesh test (Mdl_Draw's ComputeSphereVisibility): HYPOTHESIS fitted to the captured pass-1 lists (the D3D runtime is
+    // not in the exe). Rule 2 (default): a sphere that is not entirely in front of the near plane is only reported outside
+    // when entirely behind it; otherwise the exact six-plane test. Matches 41/43 stage-demo and 95/95 title lists vs 4/23 for
+    // the exact test. HOTD2_CULL_RULE=0 exact, 1 = only for centres behind the eye. Whole models (Stage_DrawSection's own
+    // test 0x00406310) always use the exact test.
+    static const int rule = getenv("HOTD2_CULL_RULE") ? atoi(getenv("HOTD2_CULL_RULE")) : 2;
+    const float w = c[0] * m[3] + c[1] * m[7] + c[2] * m[11] + m[15];
+    float col[4][4];  // col[j] = column j of m: (m[j], m[4+j], m[8+j], m[12+j])
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 4; ++i) col[j][i] = m[i * 4 + j];
+    float planes[6][4];
+    for (int i = 0; i < 4; ++i) {
+        planes[0][i] = col[3][i] + col[0][i];  // left   w + x >= 0
+        planes[1][i] = col[3][i] - col[0][i];  // right  w - x >= 0
+        planes[2][i] = col[3][i] + col[1][i];  // bottom w + y >= 0
+        planes[3][i] = col[3][i] - col[1][i];  // top    w - y >= 0
+        planes[4][i] = col[2][i];              // near   z >= 0
+        planes[5][i] = col[3][i] - col[2][i];  // far    w - z >= 0
+    }
+    for (int k = 0; k < 6; ++k) {
+        const auto& p = planes[k];
+        if (meshTest && rule == 1 && w < 0 && k != 4) continue;
+        if (meshTest && rule == 2 && w - zNear < r && k != 4) continue;  // sphere not entirely in front of the near plane
+        const float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+        if (len <= 0) continue;
+        if ((p[0] * c[0] + p[1] * c[1] + p[2] * c[2] + p[3]) / len < -r) return true;
+    }
+    return false;
+}
+
+// Mdl_ApplyPvrState 0x004A7780 / tables 0x00598B00 (zfunc), 0x00598AB0 / 0x00598AD0 (blend), 0x00598AF0 (address).
+const int kZFunc[8] = { 1, 7, 3, 5, 4, 6, 2, 8 };
+const int kSrc[8] = { 1, 2, 9, 10, 5, 6, 7, 8 };
+const int kDst[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+const int kAddr[4] = { 1, 2, 3, 2 };
+
+bool HasLayeredAlphaCards(const game::Model& model) {
+    if (model.meshes.size() < 2) return false;
+    for (const auto& mesh : model.meshes) {
+        const uint32_t isp = mesh.material.Isp(), tsp = mesh.material.Tsp();
+        if ((tsp & 0x180000) == 0x80000 || (tsp >> 29) != 4 || ((tsp >> 26) & 7) != 5 ||
+            (isp >> 29) != 4 || (isp & 0x4000000) || mesh.strips.size() != 1) return false;
+        const auto& strip = mesh.strips.front();
+        if (strip.triangleList || strip.vertices.size() != 4) return false;
+        const float z = strip.vertices.front().pos[2];
+        for (const auto& v : strip.vertices)
+            if (v.pos[2] != z || v.normal[0] != 0 || v.normal[1] != 0 || std::abs(v.normal[2]) < 0.99f)
+                return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool ModelRenderer::Init(GpuDevice* device, std::string* error) {
+    device_ = device;
+    if (!device_) {
+        if (error) *error = "no GPU device";
+        return false;
+    }
+    return true;
+}
+
+GpuTexture ModelRenderer::TextureView(const RgbaImage* img, bool alphaWeighted) {
+    if (!img) return 0;
+    const auto key = std::make_pair(img, alphaWeighted);
+    auto it = textures_.find(key);
+    if (it != textures_.end()) return it->second;
+    const GpuTexture t = device_->CreateTexture(*img, alphaWeighted);
+    if (t) textures_[key] = t;  // failures are retried (like the D3D11 renderer did)
+    return t;
+}
+
+void ModelRenderer::ClearCache() {
+    batches_.clear();
+    models_.clear(); dynModels_.clear(); textures_.clear();
+    std::vector<game::ModelVertex>().swap(cacheVerts_);
+    std::vector<game::ModelVertex>().swap(dynVerts_);
+    cacheDirty_ = boundsValid_ = haveStatic_ = haveDynamic_ = dynUploadPending_ = false;
+    device_->SetStaticVertices(nullptr, 0);
+    device_->ClearTextures();
+    previousMotion_.clear(); currentMotion_.clear(); haveTemporalHistory_ = false;
+}
+
+GpuState ModelRenderer::StateOf(bool blend, int src, int dst, int zfunc, bool zwrite, bool linear, int addrU, int addrV) {
+    GpuState s;
+    s.blendEnable = blend ? 1 : 0;
+    s.srcBlend = static_cast<uint8_t>(src);
+    s.dstBlend = static_cast<uint8_t>(dst);
+    s.zfunc = static_cast<uint8_t>(zfunc);
+    s.zwrite = zwrite ? 1 : 0;
+    s.linear = linear ? 1 : 0;
+    s.addrU = static_cast<uint8_t>(addrU);
+    s.addrV = static_cast<uint8_t>(addrV);
+    return s;
+}
+
+void ModelRenderer::SetScene(AssetStore& assets, const std::vector<const game::Model*>& models, const std::string& polName) {
+    std::vector<SceneItem> items;
+    for (const game::Model* m : models) {
+        SceneItem it;
+        it.model = m;
+        it.polName = polName;
+        items.push_back(it);
+    }
+    SetScene(assets, items);
+}
+
+const ModelRenderer::ModelGpu& ModelRenderer::CachedModel(AssetStore& assets, const game::Model* model, const std::string& polName,int refinement) {
+    auto key = std::make_tuple(model, polName,refinement,device_->EffectiveGraphics().naomiGraphics);
+    auto it = models_.find(key);
+    if (it != models_.end()) return it->second;
+    ModelGpu& g = models_[key];
+    BuildMeshes(assets, model, polName, g, cacheVerts_, false,refinement);
+    cacheDirty_ = true;
+    return g;
+}
+
+void ModelRenderer::BuildMeshes(AssetStore& assets, const game::Model* model, const std::string& polName, ModelGpu& g,
+                                std::vector<game::ModelVertex>& verts, bool dynamic,int refinement) {
+    // Mdl_Draw 0x004A7EF0: each strip's control word sets D3DRENDERSTATE_CULLMODE = 0x00598B20[ctrl & 3] = {none, none,
+    // CCW, CW} unless bit 0x80 (keep the current mode); the mode also stays set across strips. Strips are grouped into
+    // runs of one cull mode (one draw each). The state carried over from the previous model is not modelled (a model
+    // starts with "none").
+    static const int kCull[4] = { 1, 1, 3, 2 };
+    const bool cullOff = getenv("HOTD2_CULL_OFF") != nullptr;
+    const bool layeredCards = HasLayeredAlphaCards(*model);
+    int cull = 1;
+    for (const game::ModelMesh& mesh : model->meshes) {
+        Mesh m;
+        m.dynamic = dynamic;
+        m.layeredCards = layeredCards;
+        if (layeredCards) m.cardZ = mesh.strips.front().vertices.front().pos[2];
+        m.first = static_cast<uint32_t>(verts.size());
+        std::vector<std::pair<uint32_t, int>> runs;  // first vertex, cull mode
+        for (const game::ModelStrip& s : mesh.strips) {
+            if (!(s.ctrl & 0x80)) cull = kCull[s.ctrl & 3];
+            const int c = cullOff ? 1 : cull;
+            if (runs.empty() || runs.back().second != c) runs.push_back({ static_cast<uint32_t>(verts.size()), c });
+            game::Triangulate(s, verts);  // model space
+        }
+        bool refined=false;
+        const bool refineEligible=refinement>0&&!layeredCards&&(mesh.material.Tsp()&0x180000)==0x80000&&((mesh.material.Isp()>>26)&1)==0;
+        if(refineEligible&&!runs.empty()) {
+            const std::vector<game::ModelVertex> original(verts.begin()+m.first,verts.end());
+            const auto oldRuns=runs;verts.resize(m.first);runs.clear();
+            for(size_t r=0;r<oldRuns.size();++r){
+                const size_t first=oldRuns[r].first-m.first;
+                const size_t end=r+1<oldRuns.size()?oldRuns[r+1].first-m.first:original.size();
+                runs.push_back({static_cast<uint32_t>(verts.size()),oldRuns[r].second});
+                std::vector<game::ModelVertex> detailed;
+                if(RefinePnTriangles(original.data()+first,end-first,refinement,&detailed)) {verts.insert(verts.end(),detailed.begin(),detailed.end());refined=true;}
+                else verts.insert(verts.end(),original.begin()+first,original.begin()+end);
+            }
+        }
+        m.count = static_cast<uint32_t>(verts.size()) - m.first;
+        for(int k=0;k<3;++k){m.shadowBounds[k]=1e30f;m.shadowBounds[k+3]=-1e30f;}
+        for(uint32_t v=m.first;v<m.first+m.count;++v)for(int k=0;k<3;++k){
+            m.shadowBounds[k]=std::min(m.shadowBounds[k],verts[v].pos[k]);
+            m.shadowBounds[k+3]=std::max(m.shadowBounds[k+3],verts[v].pos[k]);
+        }
+        uint64_t topology = 1469598103934665603ull;
+        auto mix = [&](uint32_t value) { topology = (topology ^ value) * 1099511628211ull; };
+        mix(static_cast<uint32_t>(mesh.strips.size()));
+        if(refined)mix(0x504e0000u|static_cast<uint32_t>(refinement));
+        for (const auto& strip : mesh.strips) {
+            mix(strip.ctrl); mix(strip.triangleList ? 1u : 0u); mix(static_cast<uint32_t>(strip.vertices.size()));
+            for (uint32_t offset : strip.offsets) mix(offset);
+        }
+        // Pass selection in Mdl_Draw 0x004A7EF0.
+        const uint32_t isp = mesh.material.Isp(), tsp = mesh.material.Tsp();
+        const unsigned nativeList=(mesh.material.ParamControl()>>24)&7;
+        m.translucent = device_->EffectiveGraphics().naomiGraphics && (nativeList==0 || nativeList==2)
+            ? nativeList==2 : (tsp & 0x180000) != 0x80000;
+        m.zfunc = kZFunc[isp >> 29];
+        m.zwrite = ((isp >> 26) & 1) == 0;
+        m.srcBlend = kSrc[tsp >> 29];
+        m.dstBlend = kDst[(tsp >> 26) & 7];
+        m.linear = (tsp & 0x6000) != 0;
+        m.addrU = kAddr[(((tsp >> 3) & 0x8000) | (tsp & 0x10000)) >> 15];
+        m.addrV = kAddr[(((tsp >> 3) & 0x4000) | (tsp & 0x8000)) >> 14];
+        m.alphaFromTexture = ((tsp >> 6) & 3) == 1;
+        m.naomiDecal = ((tsp >> 6) & 3) == 0 ? ((tsp & 0x80000) ? 2 : 1) : 0;
+        m.naomiTsp = static_cast<uint8_t>(((tsp>>6)&3) | (((tsp>>19)&1)<<2) | (((tsp>>20)&1)<<3));
+        m.fog = ((tsp >> 23) & 1) == 0;  // FOGENABLE = !bit 23
+        for (int k = 0; k < 4; ++k) m.sphere[k] = mesh.material.Sphere(k);  // material bounding sphere (words 4-7)
+        if(refined) {
+            float radius2=0;for(int k=0;k<3;++k){m.sphere[k]=(m.shadowBounds[k]+m.shadowBounds[k+3])*.5f;const float half=(m.shadowBounds[k+3]-m.shadowBounds[k])*.5f;radius2+=half*half;}m.sphere[3]=std::sqrt(radius2);
+        }
+        m.ambientScale = mesh.material.AmbientScale();
+        m.naomiSpecularIndex = static_cast<int8_t>(mesh.material.words[9] & 0xffu); // native driver loads a signed byte
+        for(int k=0;k<3;++k)m.naomiSpecular[k]=mesh.material.Specular(k);
+        if (const int n = mesh.material.SpecularExponent(); n > 0 && n < 31) {  // Mdl_Draw 0x004A8026: power = 1 << n
+            for (int k = 0; k < 3; ++k) m.specular[k] = mesh.material.Specular(k);
+            m.specular[3] = static_cast<float>(1 << n);
+        }
+        const float d[4] = { mesh.material.DiffuseR(), mesh.material.DiffuseG(), mesh.material.DiffuseB(), mesh.material.DiffuseA() };
+        memcpy(m.diffuse, d, sizeof(d));
+        if (mesh.material.Textured()) {
+            const std::string& textureBank=mesh.textureBank.empty()?polName:mesh.textureBank;
+            m.tex = TextureView(assets.Texture(textureBank, mesh.material.TextureRef()), m.translucent);
+            m.textured = true;
+            if (!m.translucent) m.normalRoughness = TextureView(assets.NormalRoughness(textureBank, mesh.material.TextureRef()));
+        }
+        if (!m.count) continue;
+        const uint32_t end = m.first + m.count;
+        for (size_t r = 0; r < runs.size(); ++r) {  // one mesh per run of strips with the same cull mode
+            Mesh part = m;
+            part.first = runs[r].first;
+            part.count = (r + 1 < runs.size() ? runs[r + 1].first : end) - part.first;
+            part.cull = runs[r].second;
+            part.firstRun = r == 0;
+            part.topology = topology;
+            part.ordinal = static_cast<uint32_t>(g.meshes.size());
+            if (part.count) {
+                double sum[3] = {};
+                for (uint32_t v = part.first; v < part.first + part.count; ++v)
+                    for (int k = 0; k < 3; ++k) sum[k] += verts[v].pos[k];
+                for (int k = 0; k < 3; ++k) part.geometryCenter[k] = static_cast<float>(sum[k] / part.count);
+            }
+            if (part.count) g.meshes.push_back(part);
+        }
+    }
+}
+
+void ModelRenderer::SetScene(AssetStore& assets, const std::vector<SceneItem>& items) {
+    batches_.clear();
+    itemOrigin_.clear();
+    itemSphere_.clear();
+    itemCullable_.clear();
+    itemPriority_.clear();
+    itemAlpha_.clear();
+    itemUnitSpecular_.clear();
+    itemAuthoredMinification_.clear();
+    itemSortBackToFront_.clear();
+    itemCullFlip_.clear();
+    itemLight_.clear();
+    itemWorld_.clear();
+    itemModelView_.clear();
+    itemDirectModelView_.clear();
+    itemMotionIdentity_.clear(); itemMotionTracked_.clear(); itemMotionReactive_.clear();
+    itemShadowCaster_.clear();
+    stats_ = {};
+    boundsValid_ = false;
+    dynModels_.clear();
+    dynVerts_.clear();
+    for (const SceneItem& item : items) {
+        const float* t = item.transform;
+        const bool directModelView = item.directModelView && (item.priority == 0xC || item.priority == 8) && device_->EffectiveGraphics().naomiGraphics;
+        const int refinement=device_->EffectiveGraphics().meshRefinement>0&&item.shadowCaster&&item.alpha<0&&
+            (item.refineGeometry||(item.motionTracked&&assets.RefineModel(item.motionIdentity.model)))?device_->EffectiveGraphics().meshRefinement:0;
+        const ModelGpu* gp;
+        if (item.dynamicGeometry) {
+            dynModels_.push_back(std::make_unique<ModelGpu>());
+            BuildMeshes(assets, item.model, item.polName, *dynModels_.back(), dynVerts_, true,refinement);
+            gp = dynModels_.back().get();
+        } else {
+            gp = &CachedModel(assets, item.model, item.polName,refinement);
+        }
+        const ModelGpu& g = *gp;
+        const int itemIndex = static_cast<int>(itemOrigin_.size());
+        const float* sc = item.model->sphere;
+        float refinedSphere[4]={};
+        if(refinement&&!g.meshes.empty()) {
+            float lo[3]={1e30f,1e30f,1e30f},hi[3]={-1e30f,-1e30f,-1e30f};
+            for(const auto& mesh:g.meshes)for(int k=0;k<3;++k){lo[k]=std::min(lo[k],mesh.shadowBounds[k]);hi[k]=std::max(hi[k],mesh.shadowBounds[k+3]);}
+            float radius2=0;for(int k=0;k<3;++k){refinedSphere[k]=(lo[k]+hi[k])*.5f;const float half=(hi[k]-lo[k])*.5f;radius2+=half*half;}refinedSphere[3]=std::sqrt(radius2);sc=refinedSphere;
+        }
+        float center[3];
+        for (int k = 0; k < 3; ++k) center[k] = sc[0] * t[k] + sc[1] * t[4 + k] + sc[2] * t[8 + k] + t[12 + k];
+        const float scale = MaxAxisScale(t);
+        for (const Mesh& m : g.meshes) {
+            Batch b;
+            b.mesh = &m;
+            b.item = itemIndex;
+            b.noMeshCull = item.noMeshCull || directModelView;
+            memcpy(b.center, center, sizeof(center));
+            for (int k = 0; k < 3; ++k)  // material bounding sphere centre -> world
+                b.meshCenter[k] = m.sphere[0] * t[k] + m.sphere[1] * t[4 + k] + m.sphere[2] * t[8 + k] + t[12 + k];
+            b.meshRadius = m.sphere[3] * scale;
+            stats_.triangles += m.count / 3;
+            if (m.firstRun) {
+                ++stats_.meshes;
+                if (m.textured) (m.tex ? stats_.texturedMeshes : stats_.missingTextures)++;
+            }
+            batches_.push_back(b);
+        }
+        itemOrigin_.push_back({ t[12], t[13], t[14] });
+        itemSphere_.push_back({ center[0], center[1], center[2], sc[3] * scale });
+        itemCullable_.push_back(item.cullable && !directModelView);
+        itemPriority_.push_back(item.priority);
+        itemAlpha_.push_back(item.alpha);
+        itemUnitSpecular_.push_back(item.unitSpecular ? 1 : 0);
+        itemAuthoredMinification_.push_back(item.authoredMinification ? 1 : 0);
+        itemSortBackToFront_.push_back(item.sortBackToFront ? 1 : 0);
+        itemCullFlip_.push_back(item.cullFlip ? 1 : 0);
+        itemLight_.push_back(item.light);
+        itemMotionIdentity_.push_back(item.motionIdentity);
+        itemMotionTracked_.push_back(item.motionTracked ? 1 : 0);
+        itemMotionReactive_.push_back(item.motionReactive ? 1 : 0);
+        itemShadowCaster_.push_back(item.shadowCaster ? 1 : 0);
+        std::array<float, 16> w;
+        memcpy(w.data(), t, sizeof(float) * 16);
+        itemWorld_.push_back(w);
+        std::array<float, 16> mv;
+        memcpy(mv.data(), item.modelView, sizeof(item.modelView));
+        itemModelView_.push_back(mv);
+        itemDirectModelView_.push_back(directModelView ? 1 : 0);
+    }
+    if (!dynVerts_.empty()) {
+        haveDynamic_ = true;
+        dynUploadPending_ = true;
+    }
+    if (cacheDirty_ && !cacheVerts_.empty()) {
+        device_->SetStaticVertices(cacheVerts_.data(), cacheVerts_.size());
+        haveStatic_ = true;
+        cacheDirty_ = false;
+    }
+}
+
+void ModelRenderer::ComputeBounds() {
+    // Framing for the model viewer: AABB centre of the transformed vertices and the farthest vertex from it.
+    float lo[3] = { 1e30f, 1e30f, 1e30f }, hi[3] = { -1e30f, -1e30f, -1e30f };
+    auto each = [&](auto fn) {
+        for (const Batch& b : batches_) {
+            const float* t = itemWorld_[b.item].data();
+            for (uint32_t i = b.mesh->first; i < b.mesh->first + b.mesh->count; ++i) {
+                const float* p = cacheVerts_[i].pos;
+                float v[3];
+                for (int c = 0; c < 3; ++c) v[c] = p[0] * t[c] + p[1] * t[4 + c] + p[2] * t[8 + c] + t[12 + c];
+                fn(v);
+            }
+        }
+    };
+    each([&](const float* v) {
+        for (int i = 0; i < 3; ++i) {
+            lo[i] = std::min(lo[i], v[i]);
+            hi[i] = std::max(hi[i], v[i]);
+        }
+    });
+    for (int i = 0; i < 3; ++i) center_[i] = (lo[i] + hi[i]) / 2;
+    radius_ = 0;
+    each([&](const float* v) {
+        const float dx = v[0] - center_[0], dy = v[1] - center_[1], dz = v[2] - center_[2];
+        radius_ = std::max(radius_, std::sqrt(dx * dx + dy * dy + dz * dz));
+    });
+    if (radius_ <= 0) radius_ = 1;
+    boundsValid_ = true;
+}
+
+void ModelRenderer::AddModelDraw(GpuDrawList& list, const Mesh& m, const ModelConstants& fc, const GpuState& st) {
+    GpuDraw d;
+    d.pipeline = GpuDraw::Pipeline::Model;
+    d.stream = m.dynamic ? GpuDraw::Stream::Dynamic : GpuDraw::Stream::Static;
+    d.first = m.first;
+    d.count = m.count;
+    d.texture = m.tex;
+    d.normalRoughnessTexture = m.normalRoughness;
+    d.state = st;
+    d.constants = static_cast<uint32_t>(list.model.size());
+    list.model.push_back(fc);
+    // Reverse clip depth on the CPU, before projection, so the float depth target has
+    // useful precision on distant surfaces too. Subtracting z from w in the shader
+    // would already have lost that precision. Culling and game material state stay conventional.
+    auto& constants = list.model.back();
+    float* matrix = constants.localCount[2] > 0.5f ? constants.projection : constants.viewProj;
+    if (list.temporal.enabled && list.width > 0 && list.height > 0) {
+        const float dx = 2 * list.temporal.jitterPixels[0] / list.width;
+        const float dy = -2 * list.temporal.jitterPixels[1] / list.height;
+        for (int row = 0; row < 4; ++row) {
+            matrix[row*4] += dx * matrix[row*4+3];
+            matrix[row*4+1] += dy * matrix[row*4+3];
+        }
+    }
+    for (int row = 0; row < 4; ++row) matrix[row * 4 + 2] = matrix[row * 4 + 3] - matrix[row * 4 + 2];
+    list.draws.push_back(d);
+}
+
+bool ModelRenderer::BeginTemporal(int width, int height, const float* view, const float* projection) {
+    currentMotion_.clear();
+    temporalCamera_={};
+    bool validCamera=width>0&&height>0&&view&&projection;
+    if(validCamera)for(int k=0;k<16;++k)if(!std::isfinite(view[k])||!std::isfinite(projection[k]))validCamera=false;
+    // Depth-based scene passes need the real current camera even with history Off.
+    if(validCamera) {
+        std::copy(view,view+16,temporalCamera_.view);
+        std::copy(view,view+16,temporalCamera_.previousView);
+        for(int k=0;k<16;++k)temporalCamera_.projection[k]=temporalCamera_.previousProjection[k]=projection[k];
+        for(int row=0;row<4;++row)temporalCamera_.projection[row*4+2]=temporalCamera_.previousProjection[row*4+2]=projection[row*4+3]-projection[row*4+2];
+        temporalCamera_.valid=true;
+    }
+    temporalActive_ = temporalFrame_.enabled && width > 0 && height > 0 && view && projection;
+    if (temporalActive_) {
+        for (int k=0;k<16;++k) if (!std::isfinite(view[k]) || !std::isfinite(projection[k])) temporalActive_=false;
+        for (float jitter : temporalFrame_.jitterPixels) if (!std::isfinite(jitter) || std::abs(jitter)>1) temporalActive_=false;
+    }
+    if (!temporalActive_) {
+        previousMotion_.clear(); haveTemporalHistory_=false;
+        return false;
+    }
+    temporalReset_ = temporalFrame_.reset || !haveTemporalHistory_ ||
+        temporalFrame_.frameId != previousTemporalFrame_.frameId+1 ||
+        width!=previousTemporalWidth_ || height!=previousTemporalHeight_ ||
+        temporalScene_.world!=previousTemporalScene_.world ||
+        temporalScene_.simulationFrame<previousTemporalScene_.simulationFrame ||
+        temporalScene_.camera!=previousTemporalScene_.camera;
+    if (haveTemporalHistory_ && !temporalReset_) {
+        for (int k : {0,5,10,11,14,15})
+            if (std::abs(projection[k]-previousTemporalProjection_[k])>1e-5f) temporalReset_=true;
+        float distance2=0,alignment=0;
+        for (int k=0;k<3;++k) {
+            const float eye=-(view[12]*view[k*4]+view[13]*view[k*4+1]+view[14]*view[k*4+2]);
+            const auto& old=previousTemporalView_;
+            const float oldEye=-(old[12]*old[k*4]+old[13]*old[k*4+1]+old[14]*old[k*4+2]);
+            distance2+=(eye-oldEye)*(eye-oldEye);
+            alignment+=view[k*4+2]*old[k*4+2];
+        }
+        if (distance2>256.f*256.f || alignment<0.5f) temporalReset_=true;
+    }
+    if (temporalReset_) previousMotion_.clear();
+    std::copy(view,view+16,temporalCamera_.view);
+    std::copy(projection,projection+16,temporalCamera_.projection);
+    if(temporalReset_) {
+        std::copy(view,view+16,temporalCamera_.previousView);
+        std::copy(projection,projection+16,temporalCamera_.previousProjection);
+    } else {
+        std::copy(previousTemporalView_.begin(),previousTemporalView_.end(),temporalCamera_.previousView);
+        std::copy(previousTemporalProjection_.begin(),previousTemporalProjection_.end(),temporalCamera_.previousProjection);
+    }
+    for(int row=0;row<4;++row){
+        temporalCamera_.projection[row*4+2]=temporalCamera_.projection[row*4+3]-temporalCamera_.projection[row*4+2];
+        temporalCamera_.previousProjection[row*4+2]=temporalCamera_.previousProjection[row*4+3]-temporalCamera_.previousProjection[row*4+2];
+    }
+    temporalCamera_.valid=true;
+    std::copy(view,view+16,previousTemporalView_.begin());
+    std::copy(projection,projection+16,previousTemporalProjection_.begin());
+    previousTemporalWidth_=width; previousTemporalHeight_=height;
+    return true;
+}
+
+void ModelRenderer::AddMotionDraw(GpuDrawList& list, const Batch& batch, const GpuDraw& draw) {
+    const int item=batch.item;
+    const Mesh& mesh=*batch.mesh;
+    // Opaque-only velocity: transparent cards require reactive coverage, not an
+    // invented solid correspondence. Retain prior CPU deformation, not bone IDs.
+    if (!temporalActive_ || item<0 || !itemMotionTracked_[item] || draw.state.blendEnable || !draw.state.zwrite ||
+        list.motionVertices.size()+mesh.count>1024u*1024u) return;
+    const auto& vertices=mesh.dynamic?dynVerts_:cacheVerts_;
+    if (static_cast<size_t>(mesh.first)+mesh.count>vertices.size()) return;
+    const MotionKey key{itemMotionIdentity_[item],mesh.ordinal};
+    // Repeated identities must not silently match two distinct pieces of a model.
+    if (currentMotion_.find(key)!=currentMotion_.end()) return;
+    MotionSnapshot snapshot;
+    snapshot.topology=mesh.topology;
+    const ModelConstants& color=list.model[draw.constants];
+    std::copy(color.modelView,color.modelView+16,snapshot.modelView.begin());
+    std::copy(color.projection,color.projection+16,snapshot.projection.begin());
+    auto old=previousMotion_.find(key);
+    const bool valid=old!=previousMotion_.end() && old->second.topology==mesh.topology &&
+        old->second.positions.size()==mesh.count && !itemMotionReactive_[item];
+    MotionConstants constants{};
+    std::copy(color.modelView,color.modelView+16,constants.modelView);
+    std::copy(color.projection,color.projection+16,constants.projection);
+    std::copy(valid?old->second.modelView.begin():snapshot.modelView.begin(),valid?old->second.modelView.end():snapshot.modelView.end(),constants.previousModelView);
+    std::copy(valid?old->second.projection.begin():snapshot.projection.begin(),valid?old->second.projection.end():snapshot.projection.end(),constants.previousProjection);
+    constants.target[0]=static_cast<float>(list.width); constants.target[1]=static_cast<float>(list.height);
+    constants.target[2]=valid?1.f:0.f; // previous depth readiness remains backend-owned, zero initially
+    constants.jitter[0]=temporalFrame_.jitterPixels[0]; constants.jitter[1]=temporalFrame_.jitterPixels[1];
+    constants.jitter[2]=valid?previousTemporalFrame_.jitterPixels[0]:constants.jitter[0];
+    constants.jitter[3]=valid?previousTemporalFrame_.jitterPixels[1]:constants.jitter[1];
+    constants.alpha[0]=color.flags[0]; constants.alpha[1]=color.flags[2];
+    constants.alpha[2]=color.diffuse[3]; constants.alpha[3]=color.flags[3];
+    GpuMotionDraw motion;
+    motion.first=static_cast<uint32_t>(list.motionVertices.size()); motion.count=mesh.count;
+    motion.constants=static_cast<uint32_t>(list.motionConstants.size()); motion.texture=draw.texture; motion.state=draw.state;
+    snapshot.positions.reserve(mesh.count);
+    for (uint32_t k=0;k<mesh.count;++k) {
+        const auto& v=vertices[mesh.first+k];
+        MotionVertex mv{};
+        std::copy(v.pos,v.pos+3,mv.position); std::copy(v.uv,v.uv+2,mv.uv);
+        if(valid) std::copy(old->second.positions[k].begin(),old->second.positions[k].end(),mv.previous);
+        else std::copy(v.pos,v.pos+3,mv.previous);
+        snapshot.positions.push_back({v.pos[0],v.pos[1],v.pos[2]});
+        list.motionVertices.push_back(mv);
+    }
+    list.motionConstants.push_back(constants); list.motionDraws.push_back(motion);
+    currentMotion_.emplace(key,std::move(snapshot));
+}
+
+void ModelRenderer::SubmitGame(GpuDrawList& list) {
+    if (device_->RequiresSceneProcessing()) {
+        GpuDrawList hud;
+        hud.width=list.width; hud.height=list.height; hud.sprite=list.sprite;
+        auto first=std::remove_if(list.draws.begin(),list.draws.end(),[&](const GpuDraw& draw) {
+            if (draw.pipeline!=GpuDraw::Pipeline::Sprite || !draw.hud) return false;
+            hud.draws.push_back(draw); return true;
+        });
+        list.draws.erase(first,list.draws.end());
+        device_->Submit(list);
+        device_->ProcessScene(); // SDK failure retains the scene; HUD remains readable
+        if (!hud.draws.empty()) {
+            hud.width=device_->HudTargetWidth(); hud.height=device_->HudTargetHeight();
+            for(auto& c:hud.sprite) {c.screen[0]=hud.width/640.f;c.screen[1]=hud.height/480.f;}
+            device_->Submit(hud);
+        }
+    } else {
+        device_->Submit(list);
+        device_->ProcessScene(); // no-op on ordinary backends; original draw order untouched
+    }
+    if (temporalActive_) {
+        previousMotion_=std::move(currentMotion_);
+        previousTemporalFrame_=temporalFrame_; previousTemporalScene_=temporalScene_;
+        haveTemporalHistory_=true;
+    }
+}
+
+void ModelRenderer::Draw(int width, int height, const Camera& cam) {
+    if (!haveStatic_) return;
+    if (!boundsValid_) ComputeBounds();
+    const float cy = std::cos(cam.yawDeg * 3.14159265f / 180), sy = std::sin(cam.yawDeg * 3.14159265f / 180);
+    const float cp = std::cos(cam.pitchDeg * 3.14159265f / 180), sp = std::sin(cam.pitchDeg * 3.14159265f / 180);
+    // view = translate(-center) * R, with R = Ry(yaw) * Rx(pitch) as in tools/pol_render.py, then push by dist.
+    const float ry[16] = { cy, 0, sy, 0, 0, 1, 0, 0, -sy, 0, cy, 0, 0, 0, 0, 1 };
+    const float rx[16] = { 1, 0, 0, 0, 0, cp, -sp, 0, 0, sp, cp, 0, 0, 0, 0, 1 };
+    float r[16];
+    Multiply(rx, ry, r);  // (v - c) @ Rx^T @ Ry^T == pol_render.py's (v - c) @ (Ry @ Rx)^T
+    const float dist = radius_ * cam.distanceScale;
+    const float t[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -center_[0], -center_[1], -center_[2], 1 };
+    float view[16];
+    Multiply(t, r, view);
+    view[14] += dist;
+    // Perspective matching the offline renderer: screen = size/2 + x * (1.1 * size) / z.
+    const float zn = std::max(dist - radius_ * 1.5f, radius_ * 0.01f), zf = dist + radius_ * 1.5f;
+    const float fy = 2.2f, fx = fy * static_cast<float>(height) / width;
+    const float proj[16] = { fx, 0, 0, 0, 0, fy, 0, 0, 0, 0, zf / (zf - zn), 1, 0, 0, -zn * zf / (zf - zn), 0 };
+    ModelConstants fc = {};
+    Multiply(view, proj, fc.viewProj);
+    float lv[3] = { 0.4f, 0.8f, 0.45f };
+    const float ll = std::sqrt(lv[0] * lv[0] + lv[1] * lv[1] + lv[2] * lv[2]);
+    // Light is fixed in view space in the reference; transform it back to world space (inverse rotation).
+    for (int i = 0; i < 3; ++i) fc.lightDir[i] = (r[i * 4 + 0] * lv[0] + r[i * 4 + 1] * lv[1] + r[i * 4 + 2] * lv[2]) / ll;
+
+    GpuDrawList list;
+    list.width = width;
+    list.height = height;
+    const GpuState st = StateOf(false, 2, 1, 2, true, false, 1, 1);  // no blending, LESS + write, point / wrap
+    for (const Batch& b : batches_) {
+        if (b.mesh->dynamic) continue;  // dynamic geometry: DrawGame only
+        // Match the offline reference renderer: texture colour only, untextured meshes grey (material diffuse unused for now).
+        memcpy(fc.world, itemWorld_[b.item].data(), sizeof(fc.world));
+        const float grey = b.mesh->tex ? 1.0f : 0.7f;
+        fc.diffuse[0] = fc.diffuse[1] = fc.diffuse[2] = grey;
+        fc.diffuse[3] = 1.0f;
+        fc.flags[0] = b.mesh->tex ? 1.0f : 0.0f;
+        fc.flags[2] = 0.5f;  // reference-renderer look: alpha test at 0.5, opaque output
+        fc.flags[3] = 1.0f;
+        AddModelDraw(list, *b.mesh, fc, st);
+    }
+    device_->Submit(list);
+}
+
+void ModelRenderer::DrawWithMatrix(int width, int height, const float viewProj[16], bool unlit) {
+    if (!haveStatic_) return;
+    ModelConstants fc = {};
+    memcpy(fc.viewProj, viewProj, sizeof(fc.viewProj));
+    fc.lightDir[1] = 1;
+    fc.flags[1] = unlit ? 1.0f : 0.0f;
+    GpuDrawList list;
+    list.width = width;
+    list.height = height;
+    const GpuState st = StateOf(false, 2, 1, 2, true, false, 1, 1);
+    for (const Batch& b : batches_) {
+        if (b.mesh->dynamic) continue;  // dynamic geometry: DrawGame only
+        memcpy(fc.world, itemWorld_[b.item].data(), sizeof(fc.world));
+        const float grey = b.mesh->tex ? 1.0f : 0.7f;
+        fc.diffuse[0] = fc.diffuse[1] = fc.diffuse[2] = grey;
+        fc.diffuse[3] = 1.0f;
+        fc.flags[0] = b.mesh->tex ? 1.0f : 0.0f;
+        AddModelDraw(list, *b.mesh, fc, st);
+    }
+    device_->Submit(list);
+}
+
+void ModelRenderer::UploadDynamic() {
+    if (!dynUploadPending_) return;
+    device_->SetDynamicVertices(dynVerts_.data(), dynVerts_.size());
+    dynUploadPending_ = false;
+}
+
+void ModelRenderer::SortNaomiFlashes(GpuDrawList& list, const std::vector<size_t>& draws) {
+    if (draws.empty()) return;
+    std::vector<NaomiFlashTriangle> input, visible, sorted;
+    size_t outsideCount=0,windingCount=0;
+    // Retain a full pixel guard band even if a backend applies a subpixel
+    // temporal jitter after submission. Boundary triangles stay with the GPU.
+    const float guardX=list.width>0?2.f/list.width:0.f,guardY=list.height>0?2.f/list.height:0.f;
+    std::map<uint32_t,bool> prelit;
+    uint64_t sequence = 0;
+    for (size_t index : draws) {
+        const auto& draw = list.draws[index];
+        const auto& vertices = draw.stream == GpuDraw::Stream::Dynamic ? dynVerts_ : cacheVerts_;
+        if (draw.first > vertices.size() || draw.count > vertices.size() - draw.first || draw.count % 3) return;
+        const auto& constants = list.model[draw.constants];
+        const int instruction=(static_cast<int>(constants.flags[3])-16)&3;
+        const bool specular=constants.matSpecular[3]>0 && (constants.matSpecular[0]!=0 || constants.matSpecular[1]!=0 || constants.matSpecular[2]!=0);
+        const bool varying=constants.litDir[3]>.5f && constants.lightingOptions[1]>.5f &&
+            constants.matSpecular[3]>=0 && (constants.flags[0]<=.5f || instruction!=0 || specular);
+        prelit.emplace(static_cast<uint32_t>(index),varying);
+        const float* mv = constants.modelView;
+        for (uint32_t first = draw.first; first < draw.first + draw.count; first += 3) {
+            NaomiFlashTriangle triangle{};
+            triangle.sourceDraw = static_cast<uint32_t>(index);
+            triangle.sequence = sequence++;
+            // Both source-only additions commute. Destination-color/alpha
+            // source factors remain ordinary cutters because they feed back.
+            triangle.additive = draw.state.dstBlend == 2 && (draw.state.srcBlend == 2 || draw.state.srcBlend == 5);
+            for (int k = 0; k < 3; ++k) {
+                const auto& source = vertices[first + k];
+                auto& vertex = triangle.vertices[k];
+                if(varying && !NaomiVertexColors(source,constants,vertex.color,vertex.specular))return;
+                for (int axis = 0; axis < 3; ++axis) {
+                    vertex.pos[axis] = ((source.pos[0]*mv[axis] + source.pos[1]*mv[4+axis]) + source.pos[2]*mv[8+axis]) + mv[12+axis];
+                    vertex.normal[axis] = (source.normal[0]*mv[axis] + source.normal[1]*mv[4+axis]) + source.normal[2]*mv[8+axis];
+                }
+                std::copy(source.uv,source.uv+2,vertex.uv);
+            }
+            input.push_back(triangle);
+            if(NaomiFlashOutsideProjection(triangle,constants.projection,guardX,guardY))++outsideCount;
+            else if(NaomiFlashCulledByWinding(triangle,constants.projection,draw.state.cull,guardX,guardY))++windingCount;
+            else visible.push_back(triangle);
+        }
+    }
+    const auto dump=[&] {
+        static bool attempted=false;
+        if(const char* path=std::getenv("HOTD2_DEBUG_NAOMI_SORT_DUMP");path && *path && !attempted) {
+            attempted=true;
+            std::fprintf(stderr,"Naomi autosort failure fixture: %s (%s)\n",path,
+                WriteNaomiSortFixture(path,input,list,draws,guardX,guardY)?"written":"write failed");
+        }
+    };
+    if(const char* frame=std::getenv("HOTD2_DEBUG_NAOMI_SORT_DUMP_FRAME");frame &&
+       std::strtoull(frame,nullptr,10)==temporalScene_.simulationFrame)dump();
+    std::string error;
+    if (!SortNaomiFlashTriangles(visible,&sorted,&error)) {
+        static bool warned = false;
+        if (std::getenv("HOTD2_DEBUG_NAOMI_SORT") || !warned) {
+            std::fprintf(stderr,"Naomi effect ordering exceeded its geometry budget: frame=%llu draws=%zu triangles=%zu: %s\n",
+                static_cast<unsigned long long>(temporalScene_.simulationFrame),draws.size(),visible.size(),error.c_str());
+            warned=true;
+        }
+        dump();
+        return;
+    }
+    if(std::getenv("HOTD2_DEBUG_NAOMI_SORT")) {
+        size_t varying=0;for(const auto& entry:prelit)if(entry.second)++varying;
+        std::fprintf(stderr,"Naomi autosort: frame=%llu draws=%zu prelit=%zu triangles=%zu split-triangles=%zu source-triangles=%zu frustum-rejected=%zu winding-rejected=%zu\n",
+            static_cast<unsigned long long>(temporalScene_.simulationFrame),draws.size(),varying,visible.size(),sorted.size(),input.size(),outsideCount,windingCount);
+    }
+    // Preserve the current skinned/wave prefix; replacing the dynamic stream with
+    // just the sorted flashes would silently corrupt every other dynamic draw.
+    std::vector<game::ModelVertex> vertices = dynVerts_;
+    std::vector<GpuDraw> ordered;
+    std::map<uint32_t,uint32_t> constantsBySource;
+    const auto identity = game::Mat4::Identity();
+    for (const auto& triangle : sorted) {
+        auto found = constantsBySource.find(triangle.sourceDraw);
+        if (found == constantsBySource.end()) {
+            ModelConstants c = list.model[list.draws[triangle.sourceDraw].constants];
+            memcpy(c.modelView,identity.m,sizeof(c.modelView));
+            memcpy(c.world,identity.m,sizeof(c.world));
+            c.localCount[2]=1;
+            // The native constant-color (-1) kernel is position-independent.
+            // Bake its original byte packing before changing coordinate space;
+            // retain the material's complete texture/alpha instruction. DECAL
+            // materials without an alpha override ignore this face RGB.
+            if (c.litDir[3]>.5f && c.lightingOptions[1]>.5f && c.matSpecular[3]<0) {
+                for (int k=0;k<3;++k) {
+                    const float faceByte=std::floor(std::clamp(c.diffuse[k]*c.litDiffuse[k],0.f,1.f)*255.f);
+                    c.diffuse[k]=(c.lightingOptions[1]>1.5f?faceByte:std::floor(faceByte*255.f/256.f))/255.f;
+                }
+            }
+            // Varying colors were packed only at original source vertices and
+            // interpolated by BSP. Flat/DECAL draws retain their existing path.
+            c.litDir[3]=prelit.at(triangle.sourceDraw)?1.f:0.f;
+            c.lightingOptions[0]=c.lightingOptions[1]=0;
+            c.matSpecular[0]=c.matSpecular[1]=c.matSpecular[2]=c.matSpecular[3]=0;
+            c.flags[1]=1;c.flags[2]=-1;
+            const auto index=static_cast<uint32_t>(list.model.size());
+            list.model.push_back(c);
+            found=constantsBySource.emplace(triangle.sourceDraw,index).first;
+        }
+        const bool usePrelit=prelit.at(triangle.sourceDraw);
+        const uint32_t first=static_cast<uint32_t>(usePrelit?list.naomiPrelitVertices.size():vertices.size());
+        for (const auto& vertex : triangle.vertices) {
+            if(usePrelit) {
+                NaomiPrelitVertex v{};std::copy(vertex.pos,vertex.pos+3,v.pos);std::copy(vertex.uv,vertex.uv+2,v.uv);
+                std::copy(vertex.color,vertex.color+3,v.color);std::copy(vertex.specular,vertex.specular+3,v.specular);
+                list.naomiPrelitVertices.push_back(v);
+            } else vertices.push_back(vertex);
+        }
+        if (!ordered.empty() && ordered.back().constants == found->second) ordered.back().count += 3;
+        else {
+            auto draw=list.draws[triangle.sourceDraw];
+            draw.stream=usePrelit?GpuDraw::Stream::NaomiPrelit:GpuDraw::Stream::Dynamic;
+            if(usePrelit)draw.pipeline=GpuDraw::Pipeline::NaomiPrelit;
+            draw.first=first;draw.count=3;draw.constants=found->second;
+            ordered.push_back(draw);
+        }
+    }
+    std::vector<GpuDraw> result;
+    result.reserve(list.draws.size()+ordered.size());
+    size_t slot=0,next=0;
+    for (size_t index=0;index<list.draws.size();++index) {
+        if (slot<draws.size() && draws[slot]==index) {
+            ++slot;
+            if (next<ordered.size()) result.push_back(ordered[next++]);
+            // Splits can need more runs than the original draw slots. Expand at
+            // the final eligible slot; unrelated draws keep their own order.
+            if (slot==draws.size()) while(next<ordered.size()) result.push_back(ordered[next++]);
+        } else result.push_back(list.draws[index]);
+    }
+    device_->SetDynamicVertices(vertices.data(),vertices.size());
+    list.draws=std::move(result);
+}
+
+void ModelRenderer::AddSpriteDraw(GpuDrawList& list, int width, int height, const SpriteDraw& s, size_t index) {
+    // Same decoding as Mdl_ApplyPvrState (see BuildMeshes).
+    const bool translucent = (s.tsp & 0x180000) != 0x80000;
+    SpriteConstants sc = {};
+    sc.screen[0] = width / 640.0f;
+    sc.screen[1] = height / 480.0f;
+    sc.screen[2] = translucent ? 1.0f / 255.0f : -1.0f;
+    const GpuTexture tex = TextureView(s.texture);
+    sc.screen[3] = tex ? 1.0f : 0.0f;
+    GpuDraw d;
+    d.pipeline = GpuDraw::Pipeline::Sprite;
+    d.stream = GpuDraw::Stream::Sprite;
+    d.first = static_cast<uint32_t>(index * 4);
+    d.count = 4;
+    d.texture = tex;
+    d.hud = s.hud;
+    d.reactive = !s.hud;
+    d.state = StateOf(translucent, kSrc[s.tsp >> 29], kDst[(s.tsp >> 26) & 7], kZFunc[s.isp >> 29], ((s.isp >> 26) & 1) == 0,
+                      s.linear || (s.tsp & 0x6000) != 0, kAddr[(((s.tsp >> 3) & 0x8000) | (s.tsp & 0x10000)) >> 15],
+                      kAddr[(((s.tsp >> 3) & 0x4000) | (s.tsp & 0x8000)) >> 14]);
+    d.constants = static_cast<uint32_t>(list.sprite.size());
+    list.sprite.push_back(sc);
+    list.draws.push_back(d);
+}
+
+bool ModelRenderer::AddNaomiSpriteDraw(GpuDrawList& list,const SpriteDraw& s,const ModelConstants& frame,bool fogEnabled) {
+    // Native 0x0C0C17B0 emits one packed face RGBA and uniform reciprocal
+    // eye depth for the sprite's four screen vertices. Bridge that exact
+    // screen projection into the same camera-space sorter as native models.
+    // Native TA XY maps directly to D3D11 raster XY; the PC sprite shader's
+    // D3D7 +.5 adapter is deliberately absent here.
+    if(!s.naomiAutosort)return false;
+    const bool translucent=(s.key&0x80000000u)!=0;
+    const float* p=frame.projection;
+    const double determinant=double(p[0])*p[5]-double(p[4])*p[1];
+    if(p[3]!=0 || p[7]!=0 || !std::isfinite(determinant) || std::abs(determinant)<1e-20 || std::abs(p[11])<1e-20)return false;
+    game::ModelVertex corners[4]{};
+    const auto& first=s.v[0];
+    if(!std::isfinite(first.rhw) || first.rhw<=0)return false;
+    const double w=1./first.rhw,z=(w-p[15])/p[11];
+    for(int i=0;i<4;++i) {
+        const auto& v=s.v[i];
+        if(v.diffuse!=first.diffuse || v.rhw!=first.rhw || !std::isfinite(v.x) || !std::isfinite(v.y) || !std::isfinite(v.u) || !std::isfinite(v.v))return false;
+        const double x=(double(v.x)/320.-1)*w-z*p[8]-p[12];
+        const double y=(1-double(v.y)/240.)*w-z*p[9]-p[13];
+        corners[i].pos[0]=float((x*p[5]-y*p[4])/determinant);
+        corners[i].pos[1]=float((y*p[0]-x*p[1])/determinant);corners[i].pos[2]=float(z);
+        // Native sprite TA records use UV16: the high half of each source
+        // IEEE float (0x0C0C1A20..1A38), not a normalized 16-bit integer.
+        // C1A04..1A14 inverts V by default (flag0x20 suppresses that
+        // inversion). Combined with the native corner order, this is the same
+        // visible top-v1/bottom-v0 association already carried by SpriteQuad.
+        // Retained original TA sprites independently confirm that association.
+        uint32_t u=0,t=0;std::memcpy(&u,&v.u,4);std::memcpy(&t,&v.v,4);u&=0xffff0000u;t&=0xffff0000u;
+        std::memcpy(&corners[i].uv[0],&u,4);std::memcpy(&corners[i].uv[1],&t,4);
+        for(float coordinate:corners[i].pos)if(!std::isfinite(coordinate))return false;
+    }
+    Mesh mesh;mesh.dynamic=true;mesh.first=static_cast<uint32_t>(dynVerts_.size());mesh.count=6;mesh.tex=TextureView(s.texture);
+    if(!mesh.tex)return false;
+    for(int i:{0,1,2,2,1,3})dynVerts_.push_back(corners[i]);
+    dynUploadPending_=true;
+    ModelConstants c=frame;const auto identity=game::Mat4::Identity();
+    std::memcpy(c.world,identity.m,sizeof(c.world));std::memcpy(c.modelView,identity.m,sizeof(c.modelView));
+    c.localCount[2]=1;c.litDir[3]=0;c.lightingOptions[0]=c.lightingOptions[1]=0;
+    std::fill(c.matSpecular,c.matSpecular+4,0.f);c.flags[0]=c.flags[1]=1;c.flags[2]=-1;
+    // C1954..1978: list2 keeps texture alpha and enables face alpha;
+    // list0 forces IgnoreTexAlpha and face alpha1, with ONE/ZERO replacement.
+    c.flags[3]=translucent?27.f:23.f;
+    for(int k=0;k<3;++k)c.diffuse[k]=((first.diffuse>>(16-8*k))&255)/255.f;
+    c.diffuse[3]=translucent?(first.diffuse>>24)/255.f:1.f;
+    c.fogParams[2]=fogEnabled && !(s.tsp&0x800000u)?1.f:0.f;
+    c.materialParams[0]=c.depthEffects[0]=0;
+    // Actual native sprite headers retain wrap addressing. The loaded native
+    // first-encounter headers all use point sampling; flag0x1000 opts bilinear.
+    auto state=translucent?StateOf(true,5,6,4,false,s.linear,1,1):
+        StateOf(false,2,1,kZFunc[s.isp>>29],((s.isp>>26)&1)==0,s.linear,1,1);
+    state.cull=1;state.mipmapped=0;
+    AddModelDraw(list,mesh,c,state);list.draws.back().reactive=true;
+    return true;
+}
+
+namespace {
+void UploadSprites(GpuDevice* device, const std::vector<ModelRenderer::SpriteDraw>& sprites) {
+    std::vector<game::TLVertex> v(sprites.size() * 4);
+    for (size_t i = 0; i < sprites.size(); ++i) memcpy(&v[i * 4], sprites[i].v, sizeof(sprites[i].v));
+    device->SetSpriteVertices(v.data(), v.size());
+}
+}  // namespace
+
+void ModelRenderer::DrawGame(int width, int height, const float viewProj[16], const Lighting* light, const Fog* fog,
+                             const float* gameView, const std::vector<SpriteDraw>* sprites,
+                             const std::vector<Lighting>* itemLights, const float* projection) {
+    BeginTemporal(width,height,gameView,projection);
+    if (!haveStatic_ && !haveDynamic_ && (!sprites || sprites->empty())) return;  // sprites alone: e.g. the game-over letters
+    ModelConstants fc = {};
+    if (gameView && projection) {
+        memcpy(fc.projection, projection, sizeof(fc.projection));
+        fc.localCount[2] = 1;
+    }
+    // The light constants of one item (its own light when it has one, else the frame light).
+    const bool naomiGraphics = device_->EffectiveGraphics().naomiGraphics;
+    // Optional temporal/upscaling paths deliberately composite HUD after the
+    // scene. Keep that presentation contract instead of feeding native HUD
+    // quads into a low-resolution/temporal model pass. Direct native raster
+    // retains the original mixed model/sprite autosort below.
+    const bool nativeSpriteSort=naomiGraphics && !device_->RequiresSceneProcessing();
+    auto alphaOverride=[&](int item) {
+        return item>=0 && itemAlpha_[item]>=0 && (!naomiGraphics || itemAlpha_[item]<1);
+    };
+    const Lighting* curLight = reinterpret_cast<const Lighting*>(1);  // none set yet
+    int curNaomi = 0;
+    auto setLight = [&](const Lighting* l, bool nativeMaterial) {
+        const int naomi = naomiGraphics && nativeMaterial && l && l->enabled ? (l->naomiTable?2:l->naomiStandard?1:0) : 0;
+        if (l == curLight && naomi == curNaomi) return;
+        curLight = l;
+        curNaomi = naomi;
+        fc.lightingOptions[1] = static_cast<float>(naomi);
+        fc.lightingOptions[2] = naomi ? l->naomiIntensity : 0.f;
+        for (int k = 0; k < 4; ++k) fc.litDir[k] = fc.litAmbient[k] = 0;
+        for (int k = 0; k < 3; ++k) fc.litDiffuse[k] = fc.litSpecular[k] = 0;
+        fc.localCount[0] = 0;
+        if (!l || !l->enabled) return;
+        for (int k = 0; k < 3; ++k) {
+            fc.litDir[k] = l->dirToLight[k];
+            fc.litDiffuse[k] = naomi ? l->naomiColor[k] : l->diffuse[k];
+            fc.litSpecular[k] = naomi ? l->naomiColor[k] : l->diffuse[k];  // PC 0x004AA120: specular = diffuse
+            fc.litAmbient[k] = naomi==2 ? l->naomiTableAmbient[k] : l->ambient[k] + l->ambientRS[k];
+        }
+        fc.litDir[3] = 1;
+        const int n = std::min(l->localCount, kMaxLocalLights);
+        fc.localCount[0] = static_cast<float>(n);
+        for (int i = 0; i < n; ++i) {
+            const Lighting::Local& s = l->local[i];
+            float* p = fc.local[i * 5];
+            p[0] = s.pos[0], p[1] = s.pos[1], p[2] = s.pos[2], p[3] = s.range;
+            p[4] = s.dir[0], p[5] = s.dir[1], p[6] = s.dir[2], p[7] = s.falloff;
+            p[8] = s.diffuse[0], p[9] = s.diffuse[1], p[10] = s.diffuse[2], p[11] = static_cast<float>(s.type);
+            p[12] = s.att[0], p[13] = s.att[1], p[14] = s.att[2], p[15] = 0;
+            p[16] = std::cos(s.theta * 0.5f), p[17] = std::cos(s.phi * 0.5f), p[18] = p[19] = 0;
+        }
+    };
+    auto itemLighting = [&](int item) -> const Lighting* {
+        const int li = item >= 0 && item < static_cast<int>(itemLight_.size()) ? itemLight_[item] : -1;
+        if (itemLights && li >= 0 && li < static_cast<int>(itemLights->size())) return &(*itemLights)[li];
+        return light;
+    };
+    const bool anyLight = (light && light->enabled) || (itemLights && !itemLights->empty());
+    setLight(light, true);
+    // Normals: D3D7 transforms them by the inverse transpose of WORLD (x VIEW) and the game never sets NORMALIZENORMALS
+    // (default FALSE), so scaled models get shorter / longer normals (mode 2; sweep vs the original's shots: 4.11 mean
+    // block colour difference against 4.19 renormalised). HOTD2_NORMALS=0 renormalises, 1 = WORLD as is.
+    static const float normalMode = getenv("HOTD2_NORMALS") ? static_cast<float>(atoi(getenv("HOTD2_NORMALS"))) : 2.0f;
+    fc.localCount[1] = normalMode;
+    if (gameView) {  // eye = -t R^T of the row-vector view matrix (local viewer, specular)
+        for (int j = 0; j < 3; ++j)
+            fc.eyePos[j] = -(gameView[12] * gameView[j * 4] + gameView[13] * gameView[j * 4 + 1] + gameView[14] * gameView[j * 4 + 2]);
+    }
+    static const bool noSpecular = getenv("HOTD2_NO_SPECULAR") != nullptr;
+    bool fogEnabled = fog && fog->enabled;
+    if (naomiGraphics && fogEnabled) {
+        fogEnabled = std::isfinite(fog->start) && std::isfinite(fog->end) && fog->end > fog->start &&
+                     NaomiFogDensity(fog->end*.5f) > 0;
+        for (float color : fog->color) fogEnabled = fogEnabled && std::isfinite(color);
+    }
+    if (fogEnabled) {
+        fc.fogParams[0] = fog->start;
+        fc.fogParams[1] = fog->end;
+        for (int k = 0; k < 3; ++k) fc.fogColor[k] = fog->color[k];
+        if (naomiGraphics) {
+            fc.fogParams[3]=1;
+            fc.fogColor[3]=NaomiFogDensity(fog->end*.5f);
+        }
+    }
+    memcpy(fc.viewProj, viewProj, sizeof(fc.viewProj));
+    fc.lightDir[1] = 1;
+    fc.flags[1] = 1;  // unlit
+
+    GpuDrawList out;
+    std::vector<size_t> nativeFlashDraws;
+    std::vector<uint8_t> nativeOpaqueSprites(sprites?sprites->size():0,0);
+    out.width = width;
+    out.height = height;
+    out.temporalCamera=temporalCamera_;
+    out.sceneEffects.cinematic=cinematicEffectsAllowed_;
+    if(fog&&fog->enabled)std::copy(fog->color,fog->color+3,out.sceneEffects.fogColor);
+    if (temporalActive_) {out.temporal=temporalFrame_;out.temporal.reset=temporalReset_;}
+    UploadDynamic();
+    auto drawBatch = [&](const Batch* bb, int pass, bool casterOnly = false) {
+        const Mesh* b = bb->mesh;
+        // Negative -2/-3 indices use separate original Naomi special kernels.
+        // Retain the established path for those until their inputs are mapped.
+        setLight(itemLighting(bb->item), b->naomiSpecularIndex >= -1);
+        memcpy(fc.world, itemWorld_[bb->item].data(), sizeof(fc.world));
+        if (gameView && projection) {
+            if (itemDirectModelView_[bb->item])
+                memcpy(fc.modelView, itemModelView_[bb->item].data(), sizeof(fc.modelView));
+            else
+                Multiply(fc.world, gameView, fc.modelView);
+        }
+        memcpy(fc.diffuse, b->diffuse, sizeof(fc.diffuse));
+        const float itemAlpha = itemAlpha_[bb->item];
+        if (itemAlpha >= 0) fc.diffuse[3] *= itemAlpha;  // Mdl_DrawAlt: material alpha * record alpha
+        fc.litDiffuse[3] = b->ambientScale;
+        fc.localCount[3] = itemUnitSpecular_[bb->item] ? 1.0f : 0.0f;
+        memcpy(fc.matSpecular, b->specular, sizeof(fc.matSpecular));
+        if (fc.lightingOptions[1] > 1.5f) {
+            // 0x0C0AF610 -> 0x0C0B4E80 prepares each light through the
+            // rotation-only inverse: normalize the model axes, transpose,
+            // and remove translation. It deliberately removes model scale.
+            const Lighting* l=itemLighting(bb->item);
+            const int count=std::min(l->localCount,kMaxLocalLights);
+            float axes[3][3];
+            for(int axis=0;axis<3;++axis) {
+                const float* row=fc.world+axis*4;
+                const float length=std::sqrt((row[0]*row[0]+row[1]*row[1])+row[2]*row[2]);
+                const float inverse=length>1e-20f?1.f/length:0;
+                for(int k=0;k<3;++k)axes[axis][k]=row[k]*inverse;
+            }
+            for(int i=0;i<count;++i) {
+                const auto& source=l->local[i];float* p=fc.local[i*5];
+                const float directionLength=std::sqrt((source.dir[0]*source.dir[0]+source.dir[1]*source.dir[1])+source.dir[2]*source.dir[2]);
+                const float inverseDirection=directionLength>1e-20f?1.f/directionLength:0;
+                for(int k=0;k<3;++k) {
+                    const float* a=axes[k];
+                    p[k]=((source.pos[0]-fc.world[12])*a[0]+(source.pos[1]-fc.world[13])*a[1])+(source.pos[2]-fc.world[14])*a[2];
+                    p[4+k]=((source.dir[0]*inverseDirection*a[0]+source.dir[1]*inverseDirection*a[1])+source.dir[2]*inverseDirection*a[2]);
+                }
+                // The real PC flashlight record has nonzero phi. Native
+                // 0x0C089934 uses range65536 and half-angle0x800; actor
+                // spots have phi0 and already store their half-angle in theta.
+                p[3]=source.type==2 && source.phi>0?65536.f:source.range;
+                const float halfAngle=source.phi>0?source.phi*.5f:source.theta;
+                const float cutoff=std::cos(halfAngle);
+                p[16]=cutoff;p[17]=cutoff<1.f?1.f/(1.f-cutoff):0;
+            }
+        }
+        if (fc.lightingOptions[1] > .5f) {
+            fc.diffuse[3]=std::floor(std::clamp(fc.diffuse[3],0.f,1.f)*255.f)/255.f;
+            const float* w = fc.world;
+            fc.lightingOptions[3] = 1.f / std::max(MaxAxisScale(w), 1e-12f);
+            fc.matSpecular[3] = NaomiSpecularPower(b->naomiSpecularIndex);
+            std::copy(b->naomiSpecular,b->naomiSpecular+3,fc.matSpecular);
+            // Naomi prepares one half-vector per model, with a parallel viewer
+            // along camera +Z. Transform into model space and normalize there.
+            float h[3];
+            for (int k=0;k<3;++k) h[k]=fc.litDir[k]+(gameView?gameView[k*4+2]:(k==2?1.f:0.f));
+            float modelHalf[3];
+            float length2=0;
+            for (int k=0;k<3;++k) {
+                modelHalf[k]=(w[k*4]*h[0]+w[k*4+1]*h[1])+w[k*4+2]*h[2];
+                length2+=modelHalf[k]*modelHalf[k];
+            }
+            const float inverseLength=length2>1e-20f?1.f/std::sqrt(length2):0.f;
+            for(int k=0;k<3;++k)fc.lightDir[k]=modelHalf[k]*inverseLength;
+        } else {
+            fc.lightingOptions[3] = 0;
+            fc.lightDir[0]=fc.lightDir[2]=0;fc.lightDir[1]=1;
+        }
+        if (noSpecular && fc.matSpecular[3] > 0) fc.matSpecular[3] = 0;
+        if (!b->tex && !anyLight) fc.diffuse[0] = fc.diffuse[1] = fc.diffuse[2] = 0.7f;
+        fc.flags[0] = b->tex ? 1.0f : 0.0f;
+        fc.flags[2] = pass == 0 ? -1.0f : 1.0f / 255.0f;  // ALPHATESTENABLE only in pass 1; ALPHAREF 1, GREATEREQUAL
+        // Shading 1 (texture alpha only, ALPHAOP SELECTARG1) except on the alpha path: Mdl_DrawAlt 0x004A8440 forces
+        // TSP bit 7 (shading 2 / 3: ALPHAOP MODULATE, 0x004A7780), so the record's factor always reaches the alpha
+        fc.flags[3] = b->alphaFromTexture && itemAlpha < 0 ? 2.0f : 1.0f;
+        const bool nativeAlphaOverride=naomiGraphics && itemAlpha>=0 && itemAlpha<1;
+        if (naomiGraphics) {
+            // 0x0C0C234E OR#192 sets both shading bits, and2354 sets
+            // UseAlpha. The2324/232A gate skips this when factor>=1;
+            // IgnoreTexAlpha remains authored in either case.
+            const uint8_t state=nativeAlphaOverride?static_cast<uint8_t>((b->naomiTsp&4)|3|8):b->naomiTsp;
+            fc.flags[3]=16.f+state;
+        }
+        fc.fogParams[2] = fogEnabled && b->fog ? 1.0f : 0.0f;
+        // Modern lighting changes only opaque surfaces with a real game light. Keep the native
+        // interpolation, normal/specular corrections and blending of smoke, sky overlays and
+        // other pass-1 effects; the setting never changes simulation or material visibility.
+        fc.materialParams[0] = device_->EffectiveGraphics().materialMaps && b->normalRoughness && pass == 0 && itemAlpha < 0 ? 1.0f : 0.0f;
+        fc.lightingOptions[0] = !naomiGraphics && (device_->EffectiveGraphics().perPixelLighting || fc.materialParams[0] > 0.5f || (device_->EffectiveGraphics().shadowMaps>0&&out.shadowMap.valid)) && pass == 0 &&
+                                    itemAlpha < 0 && fc.litDir[3] > 0.5f ? 1.0f : 0.0f;
+        const GpuState st = (naomiGraphics?nativeAlphaOverride:itemAlpha>=0)
+                                 ? StateOf(true, 5, 6, b->zfunc, b->zwrite, b->linear, b->addrU, b->addrV)  // forced SRCALPHA/INVSRCALPHA
+                                 : StateOf(pass == 1, b->srcBlend, b->dstBlend, b->zfunc, b->zwrite, b->linear, b->addrU, b->addrV);
+        GpuState cs = st;
+        if (pass == 1 && naomiGraphics) {
+            // The original main-3D regions use autosorted translucency for all
+            // list-2 polygons, including world-space smoke/fire and native fades.
+            // Test against opaque scenery without writing translucent depth.
+            // PVR GEQUAL maps to D3D7 LESSEQUAL (reversed GPU depth is GEQUAL).
+            cs.zfunc = 4;
+            cs.zwrite = 0;
+            fc.flags[2] = -1; // native translucent polygons are not punch-through
+        }
+        static const bool noMips = getenv("HOTD2_NO_MIPS") != nullptr;
+        cs.mipmapped = noMips || naomiGraphics ? 0 : 1;
+        if(!noMips&&!naomiGraphics&&itemAuthoredMinification_[bb->item]&&device_->EffectiveGraphics().textureFilter==0&&
+           device_->EffectiveGraphics().anisotropy<=1)cs.mipmapped=2;
+        const bool softSmoke = pass == 1 && (b->layeredCards || itemSortBackToFront_[bb->item]) &&
+                               cs.srcBlend == 5 && cs.dstBlend == 6 && gameView && projection && std::abs(projection[11]) > 1e-6f;
+        const int softness = device_->EffectiveGraphics().softParticles;
+        fc.depthEffects[0] = softSmoke && softness > 0 ? static_cast<float>(16 << (softness - 1)) : 0;
+        fc.depthEffects[1] = 1.0f / width; fc.depthEffects[2] = 1.0f / height;
+        fc.depthEffects[3] = 0; // backend enables this only after a valid current-frame opaque snapshot
+        if (projection) {
+            fc.depthProjection[0] = projection[11] - projection[10]; fc.depthProjection[1] = projection[15] - projection[14];
+            fc.depthProjection[2] = projection[11]; fc.depthProjection[3] = projection[15];
+        }
+        cs.cull = static_cast<uint8_t>(b->cull);
+        // D3D culls by the screen winding, mirrored WORLD matrices included. The sky domes of list 0x0057A280 (6048,
+        // 6049, 6307, 6309; Sky_Task 0x004132D0 draws them with S(1.2, 1.2, -1.2)) stay visible because Res_LoadModel
+        // flips bit 0 of every strip control word when it loads one of them on its own (0x00418B68 -> 0x00419270):
+        // CW <-> CCW. The sky 6047 (type 3) is not in the list and is culled completely (attract 8100 / 20700).
+        if (itemCullFlip_[bb->item] && cs.cull >= 2) cs.cull = static_cast<uint8_t>(5 - cs.cull);
+        AddModelDraw(out, *b, fc, cs);
+        if(casterOnly) {out.shadowCasters.push_back(out.draws.back());out.draws.pop_back();return;}
+        // Autosort applies to the complete native list, including lit/specular
+        // surfaces and native fades. Their source Gouraud colors are evaluated
+        // before splitting instead of incorrectly re-lighting generated cuts.
+        if (pass == 1 && naomiGraphics && gameView && projection && b->naomiSpecularIndex>=-1 &&
+            (fc.litDir[3]<=.5f || fc.lightingOptions[1]>.5f))
+            nativeFlashDraws.push_back(out.draws.size()-1);
+        out.draws.back().reactive = pass==1 || itemMotionReactive_[bb->item];
+        if (pass==0) AddMotionDraw(out,*bb,out.draws.back());
+    };
+
+    // Shadows may be cast into the view by geometry outside its frustum. Keep a
+    // dedicated unculled list only for an enabled shadow backend; default draw
+    // order, culling, motion vertices and simulation state remain untouched.
+    float casterBounds[6]={1e30f,1e30f,1e30f,-1e30f,-1e30f,-1e30f};
+    const Lighting* shadowLight=nullptr;
+    if(device_->NeedsShadowCasters())for(const Batch& batch:batches_) {
+        const Mesh& mesh=*batch.mesh;const int item=batch.item;
+        const Lighting* illumination=itemLighting(item);
+        if(item<0||!itemShadowCaster_[item]||alphaOverride(item)||mesh.translucent||!mesh.zwrite||mesh.layeredCards||
+           !illumination||!illumination->enabled)continue;
+        drawBatch(&batch,0,true);
+        if(!shadowLight&&(illumination->diffuse[0]>0||illumination->diffuse[1]>0||illumination->diffuse[2]>0))shadowLight=illumination;
+        const auto& world=itemWorld_[item];
+        for(int corner=0;corner<8;++corner){
+            const float p[3]={mesh.shadowBounds[(corner&1)?3:0],mesh.shadowBounds[(corner&2)?4:1],mesh.shadowBounds[(corner&4)?5:2]};
+            for(int k=0;k<3;++k){const float v=p[0]*world[k]+p[1]*world[4+k]+p[2]*world[8+k]+world[12+k];casterBounds[k]=std::min(casterBounds[k],v);casterBounds[k+3]=std::max(casterBounds[k+3],v);}
+        }
+    }
+    if(shadowLight) {
+        std::copy(shadowLight->diffuse,shadowLight->diffuse+3,out.sceneEffects.lightColor);
+        std::copy(shadowLight->dirToLight,shadowLight->dirToLight+3,out.sceneEffects.lightDirection);
+        const auto& graphics=device_->EffectiveGraphics();
+        const int quality=graphics.shadowMaps>0?graphics.shadowMaps:graphics.volumetricFog>0?1:0;
+        if(quality>0)MakeShadowMapFrame(gameView,projection,shadowLight->dirToLight,casterBounds,quality,&out.shadowMap);
+        if(!graphics.shadowMaps)out.shadowMap.constants.parameters[0]=0; // visibility for fog only; surface shading stays native
+    } else if(light&&light->enabled) {
+        std::copy(light->diffuse,light->diffuse+3,out.sceneEffects.lightColor);
+        std::copy(light->dirToLight,light->dirToLight+3,out.sceneEffects.lightDirection);
+    }
+
+    // Culling (gameView only). Whole items: not submitted when the model's bounding sphere is completely outside
+    // the frustum (HYPOTHESIS: matches the pass-1 lists, see notes). Meshes: Mdl_Draw skips a mesh of the current pass
+    // when ComputeSphereVisibility reports it outside, and such a skipped mesh also defers the model to pass 1.
+    std::vector<char> itemCulled(itemOrigin_.size(), 0), batchCulled(batches_.size(), 0);
+    if (gameView) {
+        float zNear=.8f;
+        // DeviceView changes both signs. Screen-centre/Hor+ transforms leave
+        // this ratio intact: use the active lens for the near-intersection rule.
+        if (projection && std::abs(projection[11])>1e-6f && std::abs(projection[10])>1e-6f) {
+            const float value=projection[14]/projection[10];
+            if (std::isfinite(value) && value>0) zNear=value;
+        }
+        for (size_t i = 0; i < itemSphere_.size(); ++i)
+            itemCulled[i] = itemCullable_[i] && SphereOutside(viewProj, itemSphere_[i].data(), itemSphere_[i][3], false,zNear);
+        for (size_t i = 0; i < batches_.size(); ++i)
+            batchCulled[i] = !batches_[i].noMeshCull && SphereOutside(viewProj, batches_[i].meshCenter, batches_[i].meshRadius, true,zNear);
+        if (getenv("HOTD2_DEBUG_CULL"))
+            for (size_t i = 0; i < batches_.size(); ++i)
+                if (batchCulled[i] && !itemCulled[batches_[i].item])
+                    fprintf(stderr, "cull item %d batch %zu centre (%.1f %.1f %.1f) r %.1f viewZ %.1f translucent %d\n", batches_[i].item, i,
+                            batches_[i].meshCenter[0], batches_[i].meshCenter[1], batches_[i].meshCenter[2], batches_[i].meshRadius,
+                            gameView ? batches_[i].meshCenter[0] * gameView[2] + batches_[i].meshCenter[1] * gameView[6] + batches_[i].meshCenter[2] * gameView[10] + gameView[14] : 0.0f,
+                            batches_[i].mesh->translucent ? 1 : 0);
+    }
+    // Pass 0 (0x004A7A10): opaque meshes in submission order.
+    for (size_t i = 0; i < batches_.size(); ++i) {
+        const Batch& b = batches_[i];
+        if (b.mesh->translucent || batchCulled[i] || (b.item >= 0 && itemCulled[b.item])) continue;
+        if (alphaOverride(b.item)) continue;  // a native factor>=1 keeps its authored list
+        drawBatch(&b, 0);
+    }
+    if(nativeSpriteSort && gameView && projection && sprites)
+        for(size_t i=0;i<sprites->size();++i)if(!((*sprites)[i].key&0x80000000u) &&
+            AddNaomiSpriteDraw(out,(*sprites)[i],fc,fogEnabled))nativeOpaqueSprites[i]=1;
+    out.opaqueDrawCount = static_cast<uint32_t>(out.draws.size());
+
+    if (!gameView) {
+        // No game view: approximate pass 1 per batch, back to front by clip w (model viewer).
+        std::vector<const Batch*> translucent;
+        for (const Batch& b : batches_)
+            if (b.mesh->translucent || (naomiGraphics && alphaOverride(b.item))) translucent.push_back(&b);
+        auto depth = [&](const Batch* b) {
+            const auto& w = itemWorld_[b->item];
+            const float z = b->mesh->cardZ;
+            const float plane[3] = {z * w[8] + w[12], z * w[9] + w[13], z * w[10] + w[14]};
+            const float* center = b->mesh->layeredCards ? plane : b->center;
+            return center[0] * viewProj[3] + center[1] * viewProj[7] + center[2] * viewProj[11] + viewProj[15];
+        };
+        std::stable_sort(translucent.begin(), translucent.end(), [&](const Batch* a, const Batch* b) { return depth(a) > depth(b); });
+        for (const Batch* b : translucent) drawBatch(b, 1);
+        if (sprites && !sprites->empty()) {
+            UploadSprites(device_, *sprites);
+            for (size_t i = 0; i < sprites->size(); ++i) AddSpriteDraw(out, width, height, (*sprites)[i], i);
+        }
+        SubmitGame(out);
+        return;
+    }
+
+    // Pass 1 like Mdl_DrawPass1 0x004A88E0: one list of deferred models (Mdl_Submit 0x004A7E50: key 0x40000000 |
+    // priority 8 (0x007E78BC), depth = min of the model-view z of the origin and of every translucent mesh's
+    // sphere centre, as Mdl_Draw pass 0 computes it) and sprites (Spr_Submit: their own key/depth), inserted
+    // models first, sorted with the CRT qsort and comparator 0x004A8A20.
+    const float* V = gameView;
+    auto viewZ = [&](const float p[3]) { return p[0] * V[2] + p[1] * V[6] + p[2] * V[10] + V[14]; };
+    using Entry = Pass1Entry;
+    std::vector<Entry> list;
+    std::vector<std::vector<const Batch*>> itemBatches(itemOrigin_.size());  // translucent, visible: drawn in pass 1
+    std::vector<float> itemDepth(itemOrigin_.size(), 0);
+    std::vector<float> nativeSortDepth(itemOrigin_.size(), 0);
+    std::vector<double> nativeDepthSum(itemOrigin_.size(), 0);
+    std::vector<uint64_t> nativeDepthCount(itemOrigin_.size(), 0);
+    std::vector<char> deferred(itemOrigin_.size(), 0);
+    for (size_t i = 0; i < itemOrigin_.size(); ++i)
+        itemDepth[i] = itemDirectModelView_[i] ? itemModelView_[i][14] : viewZ(itemOrigin_[i].data());
+    for (size_t i = 0; i < batches_.size(); ++i) {
+        const Batch& b = batches_[i];
+        if (b.item < 0 || itemCulled[b.item]) continue;
+        const bool alphaItem = alphaOverride(b.item);
+        if (b.mesh->translucent || batchCulled[i] || alphaItem) {  // skipped in pass 0
+            deferred[b.item] = 1;
+            if (itemDirectModelView_[b.item]) {
+                const auto& mv = itemModelView_[b.item];
+                const auto* c = b.mesh->geometryCenter;
+                const double depth = double(c[0])*mv[2] + double(c[1])*mv[6] + double(c[2])*mv[10] + mv[14];
+                if (std::isfinite(depth)) {
+                    nativeDepthSum[b.item] += depth * b.mesh->count;
+                    nativeDepthCount[b.item] += b.mesh->count;
+                }
+                const float sphereDepth = b.mesh->sphere[0]*mv[2] + b.mesh->sphere[1]*mv[6] + b.mesh->sphere[2]*mv[10] + mv[14];
+                itemDepth[b.item] = std::min(itemDepth[b.item], sphereDepth);
+            } else {
+                itemDepth[b.item] = std::min(itemDepth[b.item], viewZ(b.meshCenter));
+            }
+            if ((b.mesh->translucent || alphaItem) && !batchCulled[i]) itemBatches[b.item].push_back(&b);
+        }
+    }
+    for (size_t i = 0; i < itemOrigin_.size(); ++i) {
+        nativeSortDepth[i] = nativeDepthCount[i] ? static_cast<float>(nativeDepthSum[i] / nativeDepthCount[i]) : itemDepth[i];
+        if (deferred[i]) list.push_back({ (alphaOverride(static_cast<int>(i)) ? 0x60000000u : 0x40000000u) | itemPriority_[i], itemDepth[i], static_cast<int>(i), -1 });
+    }
+    // Smoke and similar billboards contain overlapping alpha cards, sometimes authored
+    // front first. Precise depth then hides rear cards and cuts holes through the plume.
+    // Sort those cards within the model; keep its place in the mixed pass-1 list and
+    // retain depth testing/writes so scenery still occludes the effect correctly.
+    for (auto& cards : itemBatches)
+        if (cards.size() > 1 && cards.front()->mesh->layeredCards) {
+            auto planeDepth = [&](const Batch* b) {
+                if (itemDirectModelView_[b->item]) {
+                    const auto& mv = itemModelView_[b->item];
+                    return b->mesh->cardZ * mv[10] + mv[14];
+                }
+                const auto& w = itemWorld_[b->item];
+                const float z = b->mesh->cardZ;
+                const float plane[3] = {z * w[8] + w[12], z * w[9] + w[13], z * w[10] + w[14]};
+                return viewZ(plane);
+            };
+            std::stable_sort(cards.begin(), cards.end(), [&](const Batch* a, const Batch* b) {
+                return planeDepth(a) < planeDepth(b);
+            });
+        }
+    const bool haveSprites = sprites && !sprites->empty();
+    if (haveSprites) {
+        UploadSprites(device_, *sprites);
+        for (size_t i = 0; i < sprites->size(); ++i)if(!nativeOpaqueSprites[i])
+            list.push_back({ (*sprites)[i].key, (*sprites)[i].depth, -1, static_cast<int>(i) });
+    }
+    game::CrtQsort(list.data(), list.size(),
+                   [](const Entry& a, const Entry& b) { return game::ComparePass1(a.key, a.depth, b.key, b.depth); });
+    // The original's unstable qsort can reverse equal-depth model layers whenever
+    // an unrelated HUD sprite blinks. Emperor's core and reflective skin share
+    // exact sort depths, so this changes large body patches between blue and grey.
+    // Keep authored model submission order for ties. Leave sprite slots and their
+    // original CRT tie order intact (menus depend on that compositing order).
+    std::vector<Entry> tiedModels;
+    for (size_t first = 0; first < list.size();) {
+        size_t end = first + 1;
+        while (end < list.size() && game::ComparePass1(list[first].key, list[first].depth,
+                                                      list[end].key, list[end].depth) == 0) ++end;
+        tiedModels.clear();
+        if (end - first > 1)
+            for (size_t i = first; i < end; ++i)
+                if (list[i].item >= 0) tiedModels.push_back(list[i]);
+        if (tiedModels.size() > 1) {
+            std::sort(tiedModels.begin(), tiedModels.end(), [](const Entry& a, const Entry& b) { return a.item < b.item; });
+            size_t next = 0;
+            for (size_t i = first; i < end; ++i)
+                if (list[i].item >= 0) list[i] = tiedModels[next++];
+        }
+        first = end;
+    }
+    // The original near-first list lets one graded-alpha effect write depth
+    // before a rear effect contributes. Callers can opt overlapping effects
+    // into far-first compositing without changing their depth/blend state or
+    // any other model/sprite slot. Camera distance handles off-axis billboards
+    // whose view-Z order can reverse while their overlapping planes do not.
+    // Priorities remain separate; the original depth keys stay unchanged.
+    std::array<std::vector<size_t>,16> alphaSlots;
+    for (size_t i=0;i<list.size();++i) {
+        const auto& e=list[i];
+        if(e.item>=0 && itemSortBackToFront_[e.item] && !itemDirectModelView_[e.item]) alphaSlots[e.key&0xF].push_back(i);
+    }
+    for (const auto& slots:alphaSlots) if(slots.size()>1) {
+        std::vector<Entry> effects;
+        for(size_t i:slots)effects.push_back(list[i]);
+        auto distanceSquared = [&](const Entry& e) {
+            if (itemDirectModelView_[e.item]) {
+                const auto& mv = itemModelView_[e.item];
+                return double(mv[12])*mv[12] + double(mv[13])*mv[13] + double(mv[14])*mv[14];
+            }
+            const auto& p=itemOrigin_[e.item];
+            double distance=0;
+            for(int k=0;k<3;++k) {
+                const double d=static_cast<double>(p[k])-fc.eyePos[k];
+                distance+=d*d;
+            }
+            return distance;
+        };
+        std::stable_sort(effects.begin(),effects.end(),[&](const Entry& a,const Entry& b){return distanceSquared(a)>distanceSquared(b);});
+        for(size_t i=0;i<slots.size();++i)list[slots[i]]=effects[i];
+    }
+    // Keep every unrelated model/sprite slot in place. Within native camera-space
+    // effects, actual geometry depth puts the rear alpha quad before the forward
+    // additive flash; min(origin, sphere) incorrectly ties both at eye Z=-1.
+    // This is model-level compositing, not an emulation of PVR per-pixel sorting
+    // for intersecting effects belonging to different shots.
+    std::vector<size_t> nativeSlots;
+    std::vector<Entry> nativeEffects;
+    for (size_t i = 0; i < list.size(); ++i)
+        if (list[i].item >= 0 && itemDirectModelView_[list[i].item]) {
+            nativeSlots.push_back(i);
+            nativeEffects.push_back(list[i]);
+            nativeEffects.back().depth = nativeSortDepth[list[i].item];
+        }
+    std::stable_sort(nativeEffects.begin(), nativeEffects.end(), [](const Entry& a, const Entry& b) { return a.depth < b.depth; });
+    for (size_t i = 0; i < nativeSlots.size(); ++i) list[nativeSlots[i]] = nativeEffects[i];
+    lastPass1 = list;
+    bool nativeSpriteBridgeFailed=false;
+    for (const Entry& e : list) {
+        if (e.item >= 0) {
+            for (const Batch* b : itemBatches[e.item]) drawBatch(b, 1);
+        } else {
+            if(nativeSpriteSort && projection && AddNaomiSpriteDraw(out,(*sprites)[e.sprite],fc,fogEnabled))
+                nativeFlashDraws.push_back(out.draws.size()-1);
+            else {
+                if((*sprites)[e.sprite].naomiAutosort && !device_->RequiresSceneProcessing())nativeSpriteBridgeFailed=true;
+                AddSpriteDraw(out, width, height, (*sprites)[e.sprite], e.sprite);
+            }
+        }
+    }
+    UploadDynamic(); // includes bridged source sprites, also valid if sorting reaches a budget guard
+    bool gpuNativeSort=naomiGraphics && gameView && projection && !nativeSpriteBridgeFailed &&
+        !nativeFlashDraws.empty() && device_->SupportsNaomiGpuSort() && out.opaqueDrawCount<=out.draws.size();
+    std::vector<uint8_t> nativeMask;
+    if(gpuNativeSort)nativeMask.assign(out.draws.size(),0);
+    size_t previousNative=0;bool firstNative=true;
+    if(gpuNativeSort)for(size_t index:nativeFlashDraws) {
+        if(index<out.opaqueDrawCount || index>=out.draws.size() || (!firstNative && index<=previousNative)) {gpuNativeSort=false;break;}
+        const auto& d=out.draws[index];
+        if(d.pipeline!=GpuDraw::Pipeline::Model || (d.stream!=GpuDraw::Stream::Static && d.stream!=GpuDraw::Stream::Dynamic) ||
+           d.count%3 || d.constants>=out.model.size() || d.state.zfunc!=4 || d.state.zwrite) {gpuNativeSort=false;break;}
+        const auto& c=out.model[d.constants];
+        if(c.localCount[2]<=.5f || c.flags[3]<16 || c.flags[2]>=0) {gpuNativeSort=false;break;}
+        nativeMask[index]=1;previousNative=index;firstNative=false;
+    }
+    // Only explicit port HUD can follow the native resolve. Unknown model or
+    // scene-sprite blend positions require the existing mixed CPU path.
+    if(gpuNativeSort)for(size_t i=out.opaqueDrawCount;i<out.draws.size();++i)
+        if(!nativeMask[i] && (out.draws[i].pipeline!=GpuDraw::Pipeline::Sprite || !out.draws[i].hud)) {gpuNativeSort=false;break;}
+    if(gpuNativeSort) {
+        std::vector<GpuDraw> phased;phased.reserve(out.draws.size());
+        phased.insert(phased.end(),out.draws.begin(),out.draws.begin()+out.opaqueDrawCount);
+        for(size_t index:nativeFlashDraws) {auto d=out.draws[index];d.naomiSortable=true;phased.push_back(d);}
+        for(size_t i=out.opaqueDrawCount;i<out.draws.size();++i)if(!nativeMask[i])phased.push_back(out.draws[i]);
+        out.draws.swap(phased);
+        if(std::getenv("HOTD2_DEBUG_NAOMI_SORT"))std::fprintf(stderr,"Naomi GPU sort submit: frame=%llu draws=%zu\n",
+            static_cast<unsigned long long>(temporalScene_.simulationFrame),nativeFlashDraws.size());
+    } else SortNaomiFlashes(out,nativeFlashDraws);
+    SubmitGame(out);
+}
+
+void ModelRenderer::DrawSprites(int width, int height, const std::vector<SpriteDraw>& sprites) {
+    if (sprites.empty()) return;
+    UploadSprites(device_, sprites);
+    GpuDrawList out;
+    out.width = width;
+    out.height = height;
+    for (size_t i = 0; i < sprites.size(); ++i) AddSpriteDraw(out, width, height, sprites[i], i);
+    device_->Submit(out);
+}
+
+}  // namespace port

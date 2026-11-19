@@ -1,0 +1,61 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+
+def sdl = rootProject.file('../.work/deps/SDL3-3.4.18')
+if (!new File(sdl, 'CMakeLists.txt').isFile()) {
+    throw new GradleException('Run scripts/build_android.ps1 to obtain and verify SDL 3.4.18.')
+}
+
+def notices = layout.buildDirectory.dir('generated/notices')
+def copySdlLicense = tasks.register('copySdlLicense', Copy) {
+    from(new File(sdl, 'LICENSE.txt'))
+    into(notices)
+    rename { 'LICENSE-SDL.txt' }
+}
+
+android {
+    namespace 'dev.sdlprobe.android'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId providers.gradleProperty('probeApplicationId').getOrElse(namespace)
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+        testInstrumentationRunner 'dev.sdlprobe.android.ProbeTouchInstrumentation'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DSDL_SOURCE_DIR=${sdl.absolutePath}", '-DANDROID_STL=c++_static'
+                targets 'main', 'SDL3-shared'
+            }
+        }
+    }
+
+    sourceSets.main {
+        java.srcDir(new File(sdl, 'android-project/app/src/main/java'))
+        assets.srcDir(notices)
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../../native/android/CMakeLists.txt')
+            version '3.30.5'
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn(copySdlLicense)
+}

@@ -1,0 +1,79 @@
+plugins {
+    id 'com.android.application' version '8.7.3'
+}
+
+def source = rootProject.file('..')
+if (!new File(source, 'src/port/tools/play.cpp').isFile()) {
+    source = rootProject.file('../upstream/hotd2-re')
+}
+def sdl = rootProject.file('../.work/deps/SDL3-3.4.18')
+def portAssets = layout.buildDirectory.dir('generated/portAssets')
+def preparePortAssets = tasks.register('preparePortAssets', Copy) {
+    into(portAssets)
+    from(new File(source, 'scenes/st1_play.scene')) {
+        into('scenes')
+    }
+    from(new File(source, 'LICENSE')) {
+        rename { 'LICENSE-HOTD2RE.txt' }
+    }
+    from(new File(source, 'THIRD_PARTY_NOTICES.txt'))
+    from(new File(sdl, 'LICENSE.txt')) {
+        rename { 'LICENSE-SDL.txt' }
+    }
+}
+
+android {
+    namespace 'com.codepdbh.hotd2evolved'
+    compileSdk 35
+    ndkVersion '28.2.13676358'
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId providers.gradleProperty('hotd2ApplicationId').getOrElse(namespace)
+        minSdk 29
+        targetSdk 35
+        versionCode 1
+        versionName '0.1'
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                arguments "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdl.absolutePath}", '-DANDROID_STL=c++_static'
+                targets 'hotd2_android', 'SDL3-shared'
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            externalNativeBuild {
+                cmake {
+                    // The APK is debuggable, but frame performance needs an optimized engine.
+                    arguments '-DCMAKE_BUILD_TYPE=RelWithDebInfo'
+                }
+            }
+        }
+    }
+
+    sourceSets.main {
+        java.srcDir(new File(sdl, 'android-project/app/src/main/java'))
+        assets.srcDir(portAssets)
+    }
+
+    externalNativeBuild {
+        cmake {
+            path new File(source, 'CMakeLists.txt')
+            version '3.30.5'
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn(preparePortAssets)
+}

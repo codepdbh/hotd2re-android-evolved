@@ -1,0 +1,680 @@
+// sound_test <game dir> [--dump]
+// Sound tables of Snd_PlayGameSound 0x0041CFD0 read from Hod2.exe:
+//  - table sizes and that every referenced file exists (only the 36 "_OFF" SE files are absent on PC);
+//  - every sound id used by the event scripts (ops 0x38 / 0x39 / 0x3A / 0x5F in evt\*.bin) resolves to an existing file
+//    (or is a stop command / an "_OFF" loop-stop id); the 4 sound events of the st1 demo trace are found;
+//  - WAV headers parse like Snd_OpenChannel 0x004A3EF0;
+//  - SoundDriver (Snd_PlayFile 0x004AC020 channel/ring/loop logic) scenarios on a fake backend.
+// --dump prints the full id -> file table. --ids <file>: every id of a list ("<hex id> ..." per line, e.g. the distinct U-line ids
+// of the captures) resolved like the port plays it (game modes 5 and 6): files present, categories, ids without an effect.
+// --cutscene-replay <config> <script> <skip frame> <end frame>: replay a real boss intro and check that skipping
+// stops its voice without allowing the civilian actor's later queued lines to restart during the fight.
+
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "game/exe_image.h"
+#include "game/sound_driver.h"
+#include "game/sound_table.h"
+#include "game/world_internal.h"
+#include "game/world_config_io.h"
+#include "game/world_sound.h"
+
+namespace fs = std::filesystem;
+using namespace game;
+
+static int g_fail = 0;
+#define CHECK(c)                                                         \
+    do {                                                                 \
+        if (!(c)) {                                                      \
+            printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);          \
+            ++g_fail;                                                    \
+        }                                                                \
+    } while (0)
+
+static std::vector<uint8_t> ReadFile(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+}
+
+static bool IsOffName(const std::string& s) {
+    std::string u;
+    for (char c : s) u += static_cast<char>(toupper(static_cast<unsigned char>(c)));
+    return u.find("_OFF") != std::string::npos;
+}
+
+// Event script scan: opcode word 0x38 (play), 0x3A (play unless 0x009A2D74) or 0x39 (play + repeat) followed by an
+// id that the sound tables resolve. (Opcode handlers 0x0045F700 / 0x0045F750 / 0x0045F720.)
+struct EvtSound { std::string file; uint32_t offset, op, id; };
+static std::vector<EvtSound> ScanEvt(const SoundTable& t, const fs::path& dir) {
+    std::vector<EvtSound> out;
+    for (const auto& de : fs::directory_iterator(dir)) {
+        if (de.path().extension() != ".bin") continue;
+        const std::vector<uint8_t> d = ReadFile(de.path());
+        const size_t n = d.size() / 4;
+        auto w = [&](size_t i) { uint32_t v; memcpy(&v, &d[4 * i], 4); return v; };
+        for (size_t i = 0; i + 1 < n; ++i) {
+            const uint32_t op = w(i);
+            if (op == 0x5F && i + 4 < n && w(i + 2) == 0xFFFFFFFF && (w(i + 3) >> 28) == 1 &&
+                ResolveSound(t, w(i + 3)).action == SoundAction::PlayFile) {
+                // Snd_EntryBgm 0x0041D450(0, -1, id, 0): stop BGM, then play id.
+                out.push_back({de.path().filename().string(), static_cast<uint32_t>(4 * i), op, w(i + 3)});
+                continue;
+            }
+            if (op != 0x38 && op != 0x39 && op != 0x3A) continue;
+            const uint32_t id = w(i + 1);
+            if (ResolveSound(t, id).action == SoundAction::None) continue;
+            if (id == 0x100A0 || id > 0x80000002) continue;  // (scripts only use 0x80000000 of the commands)
+            out.push_back({de.path().filename().string(), static_cast<uint32_t>(4 * i), op, id});
+        }
+    }
+    return out;
+}
+
+// Fake DirectSound layer with the rules of 0x004A3EF0 / 0x004A4BE0 / 0x004A34B0 / ...
+struct FakeBackend : SoundBackend {
+    struct Ch {
+        bool buffer = false, streamed = false, playing = false, loop = false;
+        std::string path;
+        int position = 0;
+        bool paused = false;
+        SoundDriver::LoopRegion region = {};
+    };
+    Ch ch[kSndChannels];
+    std::set<std::string> missing;
+    int opens = 0, dups = 0;
+    bool acceptLoopRegions = true;
+    float gains[kSndChannels] = {};
+    bool Open(int c, const std::string& p, bool s) override {
+        // Missing files are fixture data, not a naming rule: DRIVE_OFF_22.wav is a real playable recording.
+        if (ch[c].buffer || missing.count(p)) return false;
+        ch[c] = {true, s, false, false, p};
+        ++opens;
+        return true;
+    }
+    bool Duplicate(int src, int dst) override {
+        if (ch[dst].buffer || !ch[src].buffer || ch[src].streamed) return false;
+        ch[dst] = ch[src];
+        ch[dst].playing = false;
+        ++dups;
+        return true;
+    }
+    bool Play(int c, bool loop) override {
+        if (!ch[c].buffer) return false;
+        if (!ch[c].paused || ch[c].loop != loop) ch[c].position = 0;
+        ch[c].playing = true;
+        ch[c].loop = loop;
+        ch[c].paused = false;
+        return true;
+    }
+    bool SetLoopRegion(int c, uint32_t start, uint32_t end, uint32_t rate) override {
+        if (!acceptLoopRegions || !ch[c].buffer || ch[c].playing) return false;
+        ch[c].region = {start, end, rate};
+        return true;
+    }
+    void Pause(int c) override { ch[c].paused = ch[c].playing; ch[c].playing = false; }
+    void Stop(int c) override { ch[c].playing = ch[c].paused = false; ch[c].position = 0; }
+    void Release(int c) override { ch[c] = {}; }
+    bool IsPlaying(int c) override { return ch[c].playing; }
+    void SetGain(int c, float gain) override { gains[c] = gain; }
+    void FinishAll() {  // one-shots end
+        for (Ch& x : ch)
+            if (!x.loop) x.playing = x.paused = false;
+    }
+};
+
+static void OptionFeedbackScenarios(const ExeImage& exe, const SoundTable& table) {
+    CHECK(exe.U32(0x00569798 + 74 * 8) == kOptionSelectSound);
+    CHECK(exe.U32(0x00569798 + 76 * 8) == kOptionBackSound);
+    FakeBackend backend;
+    SoundDriver driver(backend);
+    SoundDriver::Volumes volume;
+    volume.gain[SoundDriver::kSfx] = 0.4f;
+    driver.SetVolumes(volume);
+    PlaySoundEvent(driver, table, {kOptionSelectSound, 0, World::kOptionFeedback, 12, 0});
+    CHECK(backend.ch[kOptionSoundChannel].playing);
+    CHECK(backend.ch[kOptionSoundChannel].path == "Sound\\SE\\DC_SE\\OK1_22.wav");
+    CHECK(!backend.ch[kOptionSoundChannel].loop && backend.gains[kOptionSoundChannel] == 0.4f);
+    // Entering/leaving a real Options mode stops ordinary scene sounds on the following tick.
+    PlaySoundEvent(driver, table, {0, 0, World::kStopAll, 12, 0});
+    CHECK(backend.ch[kOptionSoundChannel].playing);
+    // Previewing these same recordings is still a regular SE, with normal preview-stop behavior.
+    PlaySoundEvent(driver, table, {kOptionSelectSound, 0, World::kPlayGameSound, 12, 0});
+    bool previewPlaying = false;
+    for (int ch = 0; ch < kSndSeChannels; ++ch)
+        previewPlaying |= backend.ch[ch].playing && backend.ch[ch].path == "Sound\\SE\\DC_SE\\OK1_22.wav";
+    CHECK(previewPlaying);
+    driver.PlayGameSound(table, 0x80000001);
+    for (int ch = 0; ch < kSndSeChannels; ++ch) CHECK(!backend.ch[ch].playing);
+    CHECK(backend.ch[kOptionSoundChannel].playing);
+    PlaySoundEvent(driver, table, {kOptionBackSound, 0, World::kOptionFeedback, 12, 0});
+    CHECK(backend.ch[kOptionSoundChannel].playing);
+    CHECK(backend.ch[kOptionSoundChannel].path == "Sound\\SE\\DC_SE\\RET_OPTION_22.wav");
+    CHECK(backend.opens == 3 && backend.dups == 0);
+    volume.gain[SoundDriver::kSfx] = 0;
+    driver.SetVolumes(volume);
+    CHECK(backend.gains[kOptionSoundChannel] == 0);
+    const int opens = backend.opens;
+    PlayOptionSound(driver, table, 0x10000001);
+    CHECK(backend.opens == opens);  // Only the two requested feedback commands use this channel.
+}
+
+static void PreviewScenarios(const ExeImage& exe, const SoundTable& table) {
+    FakeBackend backend;
+    SoundDriver driver(backend);
+    constexpr uint32_t first = 0x10000001, second = 0x10000000;
+    auto event = [&](int kind, uint32_t id = 0) { PlaySoundEvent(driver, table, {id, 0, kind, 4, 0}); };
+    auto& music = backend.ch[kSndBgmChannel];
+    auto& effect = backend.ch[SoundDriver::kPreviewEffectChannel];
+    SoundDriver::Volumes volume;
+    volume.gain[SoundDriver::kMusic] = 0.6f;
+    volume.gain[SoundDriver::kSfx] = 0.4f;
+    driver.SetVolumes(volume);
+
+    event(World::kPreviewMusicStart, first);
+    CHECK(music.playing && music.streamed && !music.loop && music.path == "Sound\\BGM\\ST1_AR.WAV");
+    CHECK(backend.gains[kSndBgmChannel] == 0.6f);
+    music.position = 123;
+    event(World::kPreviewMusicPlay, first);
+    CHECK(music.playing && music.position == 123);  // Play on an already-playing song does not restart it.
+    event(World::kPreviewMusicPause, second);
+    event(World::kPreviewMusicReset, second);
+    CHECK(music.playing && music.position == 123);  // Controls on another row leave this recording alone.
+    event(World::kPreviewMusicPause, first);
+    CHECK(!music.playing && music.paused && music.position == 123);
+    const int opens = backend.opens;
+    driver.OnActivate(false);
+    driver.OnActivate(true);
+    CHECK(!music.playing && music.paused);  // Modal suspension cannot undo the user's Pause.
+    event(World::kPreviewMusicPlay, first);
+    CHECK(music.playing && !music.loop && music.position == 123 && backend.opens == opens);
+    driver.OnActivate(false);
+    driver.OnActivate(true);
+    CHECK(music.playing && !music.loop && music.position == 123);
+
+    event(World::kPreviewEffect, 0x002118A9);  // Normally-looping rain effect still plays only once in Extras.
+    CHECK(effect.playing && !effect.loop && effect.path == "Sound\\SE\\STAGE1_SE\\RAIN3ST_44.wav");
+    CHECK(backend.gains[SoundDriver::kPreviewEffectChannel] == 0.4f);
+    CHECK(music.playing && music.position == 123);
+    event(World::kPreviewEffect, 0x2000009D);  // Voice previews share the effects column without interrupting BGM.
+    CHECK(effect.playing && !effect.loop && effect.path == "Sound\\Voice\\ST2\\67_YNG_M.WAV");
+    CHECK(music.playing && music.position == 123);
+    const int opened = backend.opens;
+    for (uint32_t invalid : {0u, 0x80000000u, 0x80000001u, 0x002218A9u, first})
+        event(World::kPreviewEffect, invalid);
+    CHECK(backend.opens == opened && music.playing && effect.playing);
+
+    event(World::kPreviewMusicReset, first);
+    CHECK(!music.playing && !music.paused && music.position == 0 && effect.playing);
+    event(World::kPreviewMusicPlay, first);
+    CHECK(music.playing && !music.loop && music.position == 0 && backend.opens == opened);
+    music.position = 222;
+    event(World::kPreviewMusicStart, first);
+    CHECK(music.playing && !music.loop && music.position == 0);  // Clicking the row always restarts once.
+    music.position = 333;
+    backend.FinishAll();
+    CHECK(!music.playing && !effect.playing);
+    event(World::kPreviewMusicPause, first);
+    event(World::kPreviewMusicPlay, first);
+    CHECK(music.playing && !music.loop && music.position == 0);  // Finished tracks can be played again.
+    event(World::kPreviewMusicPlay, second);
+    CHECK(music.playing && music.path == "Sound\\BGM\\ST2_AR.WAV" && !music.loop);
+
+    // All original playable preview slots are exposed by Extras. Slot zero is a stop command; every remaining
+    // slot must resolve and play once, even if its normal in-game request would loop or use the voice/coin channel.
+    CHECK(exe.U32(0x00569798) == 0x80000000);
+    music.position = 345;
+    for (int i = 1; i < 751; ++i) {
+        const uint32_t id = exe.U32(0x00569798 + i * 8);
+        const auto request = ResolveSound(table, id);
+        CHECK(request.action == SoundAction::PlayFile && request.channel != kSndBgmChannel && !request.stopLoopedSe);
+        const int previousOpens = backend.opens;
+        event(World::kPreviewEffect, id);
+        CHECK(backend.opens == previousOpens + 1 && effect.playing && !effect.loop && effect.position == 0);
+        CHECK(effect.path == request.path);
+        CHECK(music.playing && music.position == 345);
+    }
+
+    // Every available BGM, including the usually-looped stage and boss recordings, is one-shot.
+    for (size_t i = 0; i < table.BgmA().size(); ++i) {
+        if (table.BgmA()[i].empty()) continue;
+        event(World::kPreviewMusicStart, 0x10000000u | static_cast<uint32_t>(i));
+        CHECK(music.playing && !music.loop);
+        backend.FinishAll();
+        CHECK(!music.playing);
+    }
+    event(World::kPreviewMusicStart, first);
+    event(World::kPreviewEffect, kOptionSelectSound);
+    event(World::kOptionFeedback, kOptionBackSound);
+    event(World::kPreviewStop);
+    CHECK(!music.buffer && !effect.buffer && driver.CurrentBgm() == 0);
+    CHECK(backend.ch[kOptionSoundChannel].playing);
+    event(World::kPreviewMusicPlay, first);
+    event(World::kPreviewEffect, kOptionSelectSound);
+    event(World::kStopAll);
+    CHECK(!music.buffer && !effect.buffer);
+    event(World::kPreviewMusicPlay, first);
+    CHECK(music.playing && !music.loop && music.position == 0);
+    puts("Extras previews: one-shot music/effects, independent channels, pause/resume/reset and cleanup checked");
+}
+
+static void DriverScenarios(const SoundTable& t) {
+    // 1) one-shot SE: auto channel 1 (channel 0 starts out cached: the ring is zero-initialised); replaying the
+    //    same id while it plays duplicates the cached buffer into the next free channel.
+    {
+        FakeBackend b;
+        SoundDriver d(b);
+        d.PlayGameSound(t, 0x004616A9);
+        CHECK(b.ch[1].playing && b.ch[1].path == "Sound\\SE\\COMMON\\SIBUKI8_16.WAV");
+        d.PlayGameSound(t, 0x004616A9);
+        CHECK(b.dups == 1 && b.opens == 1 && b.ch[2].playing);
+        CHECK(d.Ring()[0].channel == 1 && d.Ring()[1].channel == 1 && d.Ring()[1].id == 0x004616A9);
+        // after it finished, the cached channel 1 is kept (not released) and reused by duplication again
+        b.FinishAll();
+        d.PlayGameSound(t, 0x004616A9);
+        CHECK(b.dups == 2 && b.opens == 1 && b.ch[1].buffer);
+    }
+    // 2) looped SE and its "_OFF" id: RAIN3ST_44 loops; RAIN3ST_44_OFF stops every looped SE (file is absent).
+    {
+        FakeBackend b;
+        b.missing.insert(ResolveSound(t, 0x002218A9).path);
+        SoundDriver d(b);
+        d.PlayGameSound(t, 0x002118A9);
+        CHECK(b.ch[1].playing && b.ch[1].loop && d.LoopCount() == 1);
+        d.PlayGameSound(t, 0x000718A9);  // CAR_FIRE loops too
+        CHECK(b.ch[2].playing && b.ch[2].loop && d.LoopCount() == 2);
+        d.PlayGameSound(t, 0x002218A9);
+        CHECK(!b.ch[1].playing && !b.ch[2].playing && d.LoopCount() == 0);
+    }
+    // 3) channel exhaustion: 15 different one-shots that never finish fit (channel 0 frees up once the six
+    //    zero entries left the ring), the 16th is dropped.
+    {
+        FakeBackend b;
+        SoundDriver d(b);
+        int ok = 0;
+        for (int i = 0; i < 16; ++i) ok += d.PlayFile("Sound\\SE\\X" + std::to_string(i) + ".WAV", false, -1, 0x1000 + i) ? 1 : 0;
+        CHECK(ok == 15);
+    }
+    // 4) BGM: channel 15, streamed, looped; table B in game state 6 when 0x009CA08C == 0; stop clears current.
+    {
+        FakeBackend b;
+        SoundDriver d(b);
+        d.PlayGameSound(t, 0x10000001);
+        CHECK(b.ch[15].playing && b.ch[15].streamed && b.ch[15].loop && b.ch[15].path == "Sound\\BGM\\ST1_AR.WAV");
+        CHECK(d.CurrentBgm() == 0x10000001);
+        d.PlayGameSound(t, 0x10000001, SoundContext{6, 0});
+        CHECK(b.ch[15].path == "Sound\\BGM\\ST1.WAV");
+        d.PlayGameSound(t, 0x10000009);  // OVR_AR plays once
+        CHECK(b.ch[15].playing && !b.ch[15].loop);
+        d.OnActivate(false);
+        CHECK(!b.ch[15].playing && b.ch[15].buffer);
+        d.OnActivate(true);  // preserve one-shot jingles across focus loss
+        CHECK(b.ch[15].playing && !b.ch[15].loop);
+        d.PlayGameSound(t, 0x10000001);
+        d.OnActivate(false);
+        d.OnActivate(true);
+        CHECK(b.ch[15].playing && b.ch[15].loop);
+        d.PlayGameSound(t, 0x80000000);
+        CHECK(!b.ch[15].buffer && d.CurrentBgm() == 0);
+    }
+    // 5) voice on channel 16, coin on 17, stop-all-SE releases the cached ring channels too.
+    {
+        FakeBackend b;
+        SoundDriver d(b);
+        d.PlayGameSound(t, 0x2000009D);
+        CHECK(b.ch[16].playing && b.ch[16].path == "Sound\\Voice\\ST2\\67_YNG_M.WAV");
+        d.PlayGameSound(t, 0x000021A9);
+        CHECK(b.ch[17].playing && b.ch[17].path == "Sound\\SE\\START_COIN\\COIN1_16.wav");
+        d.PlayGameSound(t, 0x002116A9);
+        b.FinishAll();
+        CHECK(b.ch[1].buffer);
+        d.PlayGameSound(t, 0x80000001);
+        CHECK(!b.ch[1].buffer);
+        d.PlayGameSound(t, 0x80000002);
+        CHECK(!b.ch[16].buffer);
+    }
+}
+
+static void StrengthSoundDispatch(const SoundTable& table) {
+    for (int kind : {World::kStrengthChainsawSound, World::kPlayGameSound}) {
+        FakeBackend backend;
+        backend.missing.insert(ResolveSound(table, 0x004E17A9).path);
+        SoundDriver driver(backend);
+        PlaySoundEvent(driver, table, {0x004D17A9, 0, kind, 6, 3});
+        CHECK(backend.ch[1].playing && backend.ch[1].path == "Sound\\SE\\COMMON2\\CHAIN_SAW_22.wav");
+        CHECK(backend.ch[1].loop && driver.LoopCount() == 1);
+        const auto& region = backend.ch[1].region;
+        if (kind == World::kStrengthChainsawSound)
+            CHECK(region.startFrame == 9542 && region.endFrame == 13162 && region.sampleRate == 22050);
+        else CHECK(region.startFrame == 0 && region.endFrame == 0 && region.sampleRate == 0);
+        backend.FinishAll();
+        CHECK(backend.ch[1].playing);  // The selected region sustains until the authored motor-off cue.
+        PlaySoundEvent(driver, table, {0x004E17A9, 0, World::kPlayGameSound, 6, 3});
+        CHECK(!backend.ch[1].playing && driver.LoopCount() == 0);
+    }
+    FakeBackend unsupported;
+    unsupported.acceptLoopRegions = false;
+    SoundDriver driver(unsupported);
+    PlaySoundEvent(driver, table, {0x004D17A9, 0, World::kStrengthChainsawSound, 6, 3});
+    CHECK(!unsupported.ch[1].playing && !unsupported.ch[1].buffer && driver.LoopCount() == 0);
+}
+
+static void LoopResetScenarios(const SoundTable& table) {
+    constexpr uint32_t chainsawOn = 0x004D17A9, chainsawOff = 0x004E17A9;
+    // Repeated scene clears / focus losses must not consume the loop registry with released channels.
+    for (int reset = 0; reset < 3; ++reset) {
+        FakeBackend backend;
+        backend.missing.insert(ResolveSound(table, chainsawOff).path);
+        SoundDriver driver(backend);
+        auto playingLoops = [&] {
+            int count = 0;
+            for (int ch = 0; ch < kSndSeChannels; ++ch)
+                count += backend.ch[ch].playing && backend.ch[ch].loop;
+            return count;
+        };
+        for (int restart = 0; restart < 6; ++restart) {
+            driver.PlayGameSound(table, chainsawOn);
+            CHECK(playingLoops() == 1);
+            if (reset == 0) driver.StopAll();
+            else if (reset == 1) driver.PlayGameSound(table, 0x80000001);
+            else { driver.OnActivate(false); driver.OnActivate(true); }
+            CHECK(playingLoops() == 0);
+        }
+        driver.PlayGameSound(table, chainsawOn);
+        CHECK(playingLoops() == 1);
+        driver.PlayGameSound(table, chainsawOff);
+        CHECK(playingLoops() == 0);
+    }
+    // An old loop's channel can be reused for a different sound after a scene clear. A later OFF must not
+    // stop that unrelated one-shot just because its channel number used to belong to the chainsaw.
+    FakeBackend backend;
+    backend.missing.insert(ResolveSound(table, chainsawOff).path);
+    SoundDriver driver(backend);
+    driver.PlayGameSound(table, chainsawOn);
+    driver.StopAll();
+    for (int i = 0; i < 7; ++i)
+        CHECK(driver.PlayFile("Sound\\SE\\ONE_SHOT.WAV", false, kSndAutoChannel, 0x1000u + i));
+    driver.PlayGameSound(table, chainsawOff);
+    int remaining = 0;
+    for (int ch = 0; ch < kSndSeChannels; ++ch) remaining += backend.ch[ch].playing;
+    CHECK(remaining == 7);
+}
+
+static void GameplayPauseScenarios(const SoundTable& table) {
+    for (uint32_t bgm : {0x10000001u, 0x10000009u}) for (int player : {0, 1}) {
+        World::Impl world;
+        world.gameMode = 6;
+        world.subState = 2;
+        world.flags5900 = 0;
+        world.player[0].state = world.player[1].state = 5;
+        FakeBackend backend;
+        SoundDriver driver(backend);
+        auto dispatch = [&] {
+            for (const auto& sound : world.sounds) PlaySoundEvent(driver, table, sound);
+            world.sounds.clear();
+        };
+        world.Sound(bgm);
+        world.Sound(0x2000009D); // existing voice and SE still stop on pause
+        world.Sound(0x004616A9);
+        dispatch();
+        auto& music = backend.ch[kSndBgmChannel];
+        const bool loop = music.loop;
+        const int opens = backend.opens;
+        music.position = 54321;
+        const std::string path = music.path;
+        for (int cycle = 0; cycle < 2; ++cycle) {
+            world.pressed = player == 0 ? 8 : 0x80000;
+            world.PauseFrame();
+            dispatch();
+            CHECK(world.paused && world.pausePlayer == player);
+            CHECK(music.buffer && music.paused && !music.playing && music.position == 54321);
+            CHECK(!backend.ch[kSndVoiceChannel].buffer);
+            for (int ch = 0; ch < kSndSeChannels; ++ch) CHECK(!backend.ch[ch].buffer);
+            world.pressed = 0;
+            for (int frame = 0; frame < 3; ++frame) { world.PauseFrame(); dispatch(); }
+            CHECK(music.buffer && music.paused && music.position == 54321 && backend.opens == opens);
+            world.pressed = player == 0 ? 8 : 0x80000;
+            world.PauseFrame();
+            dispatch();
+            CHECK(!world.paused && music.playing && !music.paused);
+            CHECK(music.position == 54321 && music.loop == loop && music.path == path && backend.opens == opens);
+            CHECK(driver.CurrentBgm() == bgm && world.currentBgm == bgm);
+            world.pressed = 0;
+            for (int frame = 0; frame < 3; ++frame) { world.PauseFrame(); dispatch(); }
+        }
+    }
+    puts("Gameplay pause: both players resume the existing BGM position and loop mode without reopening");
+}
+
+static void CutsceneSkipScenarios() {
+    for (bool skippable : {false, true}) for (bool requested : {false, true}) {
+        World::Impl world;
+        world.gameMode = 6;
+        world.runner = std::make_unique<EventRunner>(world.mem, world, &world.env, &world.exe);
+        world.runner->skippable = skippable;
+        world.runner->globals[0x009A2230] = 0;  // event opcode 0x2C arms the cutscene
+        world.runner->camera.playTick = 80;
+        world.runner->camera.endTick = 200;
+        world.skipRequest = requested;
+        world.NewTask<WTask>(WorldTramp<&World::Impl::TaskSkipWatch>, fn::kSkipWatch2);
+        SetCurrentWorld(&world);
+        world.ts.RunFrame();
+        SetCurrentWorld(nullptr);
+        const bool skipped = skippable && requested;
+        // Civilian actors read GlobalInt rather than the subtitle/actor25 skip2230 field.
+        CHECK(world.GlobalInt(0x009A2230, 0) == static_cast<int>(skipped));
+        CHECK(world.skip2230 == static_cast<int>(skipped));
+        CHECK(world.runner->skipping == skipped);
+        CHECK(world.runner->camera.endTick == (skipped ? 80 : 200));
+        // The transient skip ends on the next watcher call; neither reader may retain it.
+        SetCurrentWorld(&world);
+        world.ts.RunFrame();
+        SetCurrentWorld(nullptr);
+        CHECK(world.skip2230 == 0 && world.GlobalInt(0x009A2230, -1) == 0);
+    }
+}
+
+static void CutsceneSkipReplay(const fs::path& game, const SoundTable& table, const std::string& config,
+                               const std::string& script, int skipFrame, int endFrame) {
+    World world;
+    WorldConfig cfg;
+    std::string error;
+    if (!LoadWorldConfig(config, &cfg, &error) || !world.Load(game.string(), cfg.eventMode, &error) ||
+        !world.StartStage(cfg, &error)) {
+        printf("FAIL cutscene replay: %s\n", error.c_str()); ++g_fail; return;
+    }
+    struct Input { int frame, player; float x, y; unsigned buttons; };
+    std::vector<Input> inputs;
+    std::ifstream file(script); std::string line;
+    while (std::getline(file, line)) {
+        Input in{}; std::istringstream row(line);
+        if (row >> in.frame >> in.player >> in.x >> in.y >> in.buttons) inputs.push_back(in);
+    }
+    CHECK(!inputs.empty());
+    FakeBackend backend;
+    SoundDriver driver(backend);
+    size_t pos = 0; float x[2] = {.5f, .5f}, y[2] = {.5f, .5f}; uint8_t buttons[2] = {};
+    bool skipped = false, voiceBefore = false, stopped = false, resumed = false;
+    for (const auto& sound : world.Sounds()) PlaySoundEvent(driver, table, sound);
+    while (world.Frame() < endFrame) {
+        const int frame = world.Frame() + 1;
+        uint8_t prev[2] = {buttons[0], buttons[1]};
+        while (pos < inputs.size() && inputs[pos].frame <= frame) {
+            const auto in = inputs[pos++]; x[in.player] = in.x; y[in.player] = in.y;
+            buttons[in.player] = static_cast<uint8_t>(in.buttons);
+        }
+        for (int p = 0; p < 2; ++p) world.SetInput(p, MakeWorldInput(x[p], y[p], buttons[p], prev[p]));
+        if (frame == skipFrame) {
+            CHECK(world.Hud().skippable);
+            voiceBefore = backend.ch[kSndVoiceChannel].playing;
+            world.SetInput(0, MakeWorldInput(.5f, .5f, 2, 0));  // reload accepts the real cutscene skip
+        }
+        world.Step();
+        if (frame == skipFrame) skipped = world.Hud().skipping;
+        for (const auto& sound : world.Sounds()) {
+            if (frame > skipFrame && sound.kind == World::kPlayGameSound) {
+                stopped |= sound.id == 0x80000002u;
+                resumed |= (sound.id >> 28) == 2;
+            }
+            PlaySoundEvent(driver, table, sound);
+        }
+    }
+    CHECK(voiceBefore && skipped && stopped && !resumed);
+    CHECK(!backend.ch[kSndVoiceChannel].playing && !backend.ch[kSndVoiceChannel].buffer);
+    CHECK(backend.ch[kSndBgmChannel].playing && world.Hud().canShoot);
+    printf("cutscene replay %d..%d: active voice %d, skip %d, stop %d, later voice %d, boss playable %d\n",
+           skipFrame, endFrame, voiceBefore, skipped, stopped, resumed, world.Hud().canShoot);
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: sound_test <game dir> [--dump]\n");
+        return 2;
+    }
+    const fs::path game = argv[1];
+    const bool dump = argc > 2 && std::string(argv[2]) == "--dump";
+    std::string idList;
+    for (int i = 2; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "--ids") idList = argv[i + 1];
+    ExeImage exe;
+    if (!exe.Load((game / "Hod2.exe").string())) {
+        fprintf(stderr, "cannot load Hod2.exe\n");
+        return 2;
+    }
+    SoundTable t;
+    CHECK(t.Load(exe));
+    printf("SE %zu, voice %zu, BGM %zu + %zu, looped SE %zu\n", t.Se().size(), t.Voices().size(), t.BgmA().size(),
+           t.BgmB().size(), t.LoopIds().size());
+    CHECK(t.Se().size() == 324 && t.Voices().size() == 467 && t.LoopIds().size() == 44);
+    if (!idList.empty()) {  // the ids the original issued (captures' U lines) through ResolveSound
+        std::ifstream in(idList);
+        std::map<std::string, int> cats;
+        int n = 0;
+        for (std::string line; std::getline(in, line);) {
+            if (line.empty()) continue;
+            const uint32_t id = static_cast<uint32_t>(std::stoul(line.substr(0, line.find(' ')), nullptr, 16));
+            ++n;
+            for (int mode : { 6, 5 }) {
+                SoundContext ctx;
+                ctx.gameState = mode;
+                const SoundRequest r = ResolveSound(t, id, ctx);
+                std::string cat;
+                switch (r.action) {
+                case SoundAction::PlayFile:
+                    if (fs::exists(game / r.path)) cat = r.channel == kSndBgmChannel ? (r.loop ? "BGM looped" : "BGM once") : r.channel == kSndVoiceChannel ? "voice" : r.loop ? "SE looped" : "SE";
+                    else if (IsOffName(r.path)) cat = "SE _OFF (stops the looped SEs; no file on PC)";
+                    else {
+                        cat = "MISSING FILE";
+                        printf("MISSING %08X %s\n", id, r.path.c_str());
+                        ++g_fail;
+                    }
+                    break;
+                case SoundAction::StopBgm: cat = "stop BGM"; break;
+                case SoundAction::StopAllSe: cat = "stop all SE"; break;
+                case SoundAction::StopVoice: cat = "stop voice"; break;
+                case SoundAction::AllOff: cat = "all off (no-op on PC)"; break;
+                default:
+                    cat = "no effect";
+                    printf("no effect (mode %d): %08X\n", mode, id);
+                    break;
+                }
+                ++cats[std::string(mode == 6 ? "mode 6: " : "mode 5: ") + cat];
+            }
+        }
+        printf("%d ids from %s:\n", n, idList.c_str());
+        for (const auto& [c, k] : cats) printf("  %-60s %d\n", c.c_str(), k);
+    }
+
+    // Every table entry: file present (except "_OFF" SEs), WAV header parses.
+    int files = 0, missing = 0, missingOff = 0, badWav = 0;
+    auto checkFile = [&](const std::string& rel, uint32_t id) {
+        const fs::path p = game / rel;
+        if (!fs::exists(p)) {
+            if (IsOffName(rel)) ++missingOff;
+            else {
+                ++missing;
+                printf("MISSING %08X %s\n", id, rel.c_str());
+            }
+            return;
+        }
+        ++files;
+        const std::vector<uint8_t> d = ReadFile(p);
+        WavInfo w;
+        if (!ParseWavHeader(d.data(), d.size(), w) || w.formatTag != 1 || w.bitsPerSample != 16 ||
+            w.dataOffset + w.dataSize > d.size()) {
+            ++badWav;
+            printf("BAD WAV %s\n", rel.c_str());
+        }
+    };
+    std::map<uint32_t, std::string> all;
+    for (const SeEntry& e : t.Se()) all[e.id] = ResolveSound(t, e.id).path;
+    for (size_t i = 0; i < t.BgmA().size(); ++i)
+        if (!t.BgmA()[i].empty()) all[0x10000000 | static_cast<uint32_t>(i)] = ResolveSound(t, 0x10000000 | static_cast<uint32_t>(i)).path;
+    for (size_t i = 0; i < t.Voices().size(); ++i)
+        if (t.Voices()[i].number != -1) all[0x20000000 | static_cast<uint32_t>(i)] = ResolveSound(t, 0x20000000 | static_cast<uint32_t>(i)).path;
+    for (const auto& [id, rel] : all) checkFile(rel, id);
+    for (size_t i = 0; i < t.BgmB().size(); ++i)
+        if (!t.BgmB()[i].empty()) checkFile("Sound\\BGM\\" + t.BgmB()[i], 0x10000000 | static_cast<uint32_t>(i));
+    printf("table files present: %d, missing: %d (+%d \"_OFF\" SEs, absent on PC), bad WAV headers: %d\n", files,
+           missing, missingOff, badWav);
+    CHECK(missing == 0 && missingOff == 36 && badWav == 0);
+    for (size_t i = 0; i < t.LoopOffIds().size(); ++i) CHECK(IsOffName(t.FindSe(t.LoopOffIds()[i])->file));
+
+    // Event scripts.
+    const std::vector<EvtSound> ev = ScanEvt(t, game / "evt");
+    std::map<std::string, int> perFile;
+    std::set<uint32_t> ids;
+    int evMissing = 0;
+    for (const EvtSound& e : ev) {
+        ++perFile[e.file];
+        ids.insert(e.id);
+        const SoundRequest r = ResolveSound(t, e.id);
+        if (r.action == SoundAction::PlayFile && !fs::exists(game / r.path) && !r.stopLoopedSe) {
+            ++evMissing;
+            printf("EVT MISSING %s+0x%X %08X %s\n", e.file.c_str(), e.offset, e.id, r.path.c_str());
+        }
+    }
+    for (const auto& [f, c] : perFile) printf("  %s: %d sound ops\n", f.c_str(), c);
+    printf("event-script sound ops: %zu, distinct ids: %zu, unresolved files: %d\n", ev.size(), ids.size(), evMissing);
+    CHECK(evMissing == 0 && ev.size() >= 320);
+    // Runtime trace (build\scene_capture_st1demo.txt "E <f> 56 <addr> <id>", stage table at 0x00977400).
+    const std::pair<uint32_t, uint32_t> traced[] = {{0x0097A42C, 0x004616A9}, {0x0097A444, 0x004616A9},
+                                                    {0x0097A480, 0x004616A9}, {0x0097A52C, 0x002116A9}};
+    for (const auto& [addr, id] : traced) {
+        bool found = false;
+        for (const EvtSound& e : ev)
+            found |= e.file == "st1evtbl.bin" && e.offset == addr - 0x00977400 && e.id == id && e.op == 0x38;
+        CHECK(found);
+    }
+
+    OptionFeedbackScenarios(exe, t);
+    PreviewScenarios(exe, t);
+    DriverScenarios(t);
+    StrengthSoundDispatch(t);
+    LoopResetScenarios(t);
+    GameplayPauseScenarios(t);
+    CutsceneSkipScenarios();
+    for (int i = 2; i + 4 < argc; ++i)
+        if (std::string(argv[i]) == "--cutscene-replay")
+            CutsceneSkipReplay(game, t, argv[i + 1], argv[i + 2], std::stoi(argv[i + 3]), std::stoi(argv[i + 4]));
+
+    if (dump) {
+        for (const auto& [id, rel] : all) {
+            const SoundRequest r = ResolveSound(t, id);
+            printf("%08X ch=%d loop=%d off=%d %s\n", id, r.channel, r.loop, r.stopLoopedSe, rel.c_str());
+        }
+        for (size_t i = 0; i < t.BgmB().size(); ++i)
+            if (!t.BgmB()[i].empty()) printf("%08X (state 6, 0x009CA08C == 0) Sound\\BGM\\%s\n", 0x10000000 | static_cast<unsigned>(i), t.BgmB()[i].c_str());
+        for (uint32_t id : ids) printf("evt id %08X -> %s\n", id, ResolveSound(t, id).path.c_str());
+    }
+    printf("%s\n", g_fail ? "FAILED" : "OK");
+    return g_fail ? 1 : 0;
+}

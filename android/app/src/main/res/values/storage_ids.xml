@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item type="id" name="storage_select" />
+    <item type="id" name="storage_path" />
+    <item type="id" name="storage_read" />
+    <item type="id" name="storage_status" />
+</resources>

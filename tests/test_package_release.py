@@ -1,0 +1,761 @@
+"""Synthetic package and read-only game metadata tests; no original game data."""
+import base64
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+import zlib
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import package_release as release
+
+
+def fake_pe(path, architecture="x86", label=None, dll=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = bytearray(4096)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 128)
+    data[128:132] = b"PE\0\0"
+    wide = architecture == "x64"
+    struct.pack_into("<HHIIIHH", data, 132, 0x8664 if wide else 0x14C, 1, 0, 0, 0, 240 if wide else 224, 0x102 | (0x2000 if dll else 0))
+    struct.pack_into("<H", data, 152, 0x20B if wide else 0x10B)
+    if label:
+        text = label.encode("ascii") + b"\0"
+        data[1024:1024 + len(text)] = text
+    path.write_bytes(data)
+    return path
+
+
+def fake_typing_reference(path, payload=b"synthetic container fixture"):
+    """Structurally complete v5 metadata; no original game assets."""
+    data = bytearray(b"TOTDREF1")
+    def word(value):
+        data.extend(struct.pack("<I", value))
+    def blob(value=b""):
+        word(len(value)); data.extend(value)
+    for value in (5, 1, 0, 8, 0, 0, 0, 0, 0):
+        word(value)
+    blob(payload)
+    for mode in (0, 1, 2, 3, 4, 5, 7, 9):
+        word(mode); blob(); blob(); blob()
+    word(0x02000000); blob(b"fixture program")
+    for _ in range(7):
+        word(0)  # Civilian scripts, sprites, rewards, models, sounds, native sounds, sound files.
+    for length in (732 * 2, 402 * 16, 375 * 64, 402 * 8, 128 * 2):
+        blob(bytes(length))
+    word(0)
+    path.write_bytes(data)
+    return path
+
+
+class Packaging(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="hotd2-package-fixture-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.source = self.root / "source"
+        (self.source / "src/port/tools").mkdir(parents=True)
+        (self.source / "src/port/tools/play.cpp").write_text('''#if INTPTR_MAX == INT64_MAX
+constexpr uint32_t kBuildId = 2026101906;
+const char* const kBuildName = "2026 10 19 NS64";
+#else
+constexpr uint32_t kBuildId = 2026101905;
+const char* const kBuildName = "2026 10 19 NS32";
+#endif
+''')
+        (self.source / "scenes").mkdir()
+        (self.source / "scenes/st1_play.scene").write_text("world external\n")
+        (self.source / "THIRD_PARTY_NOTICES.txt").write_text("Fixture shader notices\n")
+        (self.source / "LICENSE").write_text("Fixture code license\n")
+        dependency = self.source / "build/_deps/sdl3-src"
+        dependency.mkdir(parents=True)
+        (dependency / "LICENSE.txt").write_text("Fixture SDL license\n")
+        self.exe = fake_pe(self.source / "build/src/port/Release/hotd2.exe", label="2026 10 19 NS32")
+        self.revision = patch.object(release, "source_revision", return_value={"baseRevision": "0" * 40, "status": "synthetic fixture"})
+        self.revision.start()
+        self.addCleanup(self.revision.stop)
+
+    def package(self, **arguments):
+        return release.stage_package(kind=arguments.pop("kind", "public"), architecture=arguments.pop("architecture", "x86"), exe=arguments.pop("exe", self.exe), source_dir=self.source,
+                                     out=arguments.pop("out", self.root / "new-output"), **arguments)
+
+    def test_actual_pe_selects_ns32_when_source_lists_ns64_first(self):
+        info = release.executable_info(self.exe, self.source, "x86")
+        self.assertEqual((info["buildLabel"], info["sourceBuildId"], info["machine"]), ("2026 10 19 NS32", 2026101905, "0x014c"))
+        self.assertNotIn("releaseVersion", info)
+        other = fake_pe(self.root / "x64.exe", "x64", "2026 10 19 NS64")
+        self.assertEqual(release.executable_info(other, self.source, "x64")["peFormat"], "PE32+")
+
+    def test_wrong_architecture_kind_or_label_is_rejected(self):
+        with self.assertRaises(ValueError):
+            release.executable_info(self.exe, self.source, "x64")
+        for label in ("old build", "2026 10 19 NS64"):
+            broken = fake_pe(self.root / "wrong.exe", label=label)
+            with self.assertRaises(ValueError):
+                release.executable_info(broken, self.source, "x86")
+        with self.assertRaises(ValueError):
+            release.pe_info(fake_pe(self.root / "not-an-exe.exe", dll=True))
+
+    def test_updater_version_does_not_override_architecture_display_label(self):
+        (self.source / "src/port/tools/play.cpp").write_text('''#if INTPTR_MAX == INT64_MAX
+constexpr uint32_t kBuildId = 2026102300;
+const char* const kBuildName = "2026 10 23 A";
+#else
+constexpr uint32_t kBuildId = 2026102301;
+const char* const kBuildName = "2026 10 23 NS32 A";
+#endif
+const char* const kUpdateBuildName = "2026 10 23 A";
+''')
+        exe = fake_pe(self.root / "updater.exe", "x86", "2026 10 23 NS32 A")
+        exe.write_bytes(exe.read_bytes() + b"2026 10 23 A\0")
+        info = release.executable_info(exe, self.source, "x86")
+        self.assertEqual((info["buildLabel"], info["sourceBuildId"]), ("2026 10 23 NS32 A", 2026102301))
+        wide = fake_pe(self.root / "updater64.exe", "x64", "2026 10 23 A")
+        self.assertEqual(release.executable_info(wide, self.source, "x64")["sourceBuildId"], 2026102300)
+        missing_display = fake_pe(self.root / "missing-label.exe", "x86", "2026 10 23 A")
+        with self.assertRaises(ValueError):
+            release.executable_info(missing_display, self.source, "x86")
+
+    def test_truncated_or_hostile_pe_offsets_are_rejected(self):
+        for data in (b"MZ", b"not an exe", self.exe.read_bytes()[:160]):
+            broken = self.root / "broken.exe"
+            broken.write_bytes(data)
+            with self.assertRaises(ValueError):
+                release.pe_info(broken)
+        broken = bytearray(self.exe.read_bytes())
+        struct.pack_into("<I", broken, 0x3C, 0xFFFFFFFF)
+        (self.root / "offset.exe").write_bytes(broken)
+        with self.assertRaises(ValueError):
+            release.pe_info(self.root / "offset.exe")
+
+    def test_existing_output_is_refused_without_removing_anything(self):
+        output = self.root / "keep"
+        output.mkdir()
+        marker = output / "important.txt"
+        marker.write_bytes(b"preserve this")
+        with self.assertRaisesRegex(ValueError, "Output already exists"):
+            self.package(out=output)
+        self.assertEqual(marker.read_bytes(), b"preserve this")
+        self.assertEqual(list(output.iterdir()), [marker])
+
+    def test_release_version_is_public_while_internal_build_labels_are_preserved(self):
+        (self.source / "src/port/tools/play.cpp").write_text('''#if INTPTR_MAX == INT64_MAX
+constexpr uint32_t kBuildId = 2026102302;
+const char* const kBuildName = "2026 10 23 B";
+#else
+constexpr uint32_t kBuildId = 2026102303;
+const char* const kBuildName = "2026 10 23 NS32 B";
+#endif
+const char* const kReleaseVersion = "1.0";
+''')
+        game, game_manifest, _ = self.game_manifest()
+        for architecture, label, build_id in (("x64", "2026 10 23 B", 2026102302), ("x86", "2026 10 23 NS32 B", 2026102303)):
+            exe = fake_pe(self.root / architecture / "hotd2.exe", architecture, label)
+            exe.write_bytes(exe.read_bytes() + b"1.0\0")
+            info = release.executable_info(exe, self.source, architecture)
+            self.assertEqual((info["releaseVersion"], info["buildLabel"], info["sourceBuildId"]), ("1.0", label, build_id))
+            for kind in ("public", "complete"):
+                with self.subTest(architecture=architecture, kind=kind):
+                    arguments = dict(game_dir=game, game_manifest=game_manifest) if kind == "complete" else {}
+                    archive = self.package(kind=kind, architecture=architecture, exe=exe,
+                                           out=self.root / f"release-{architecture}-{kind}", **arguments)
+                    expected_name = f"HOTD2RE-1.0-Windows-{architecture}.zip" if kind == "complete" else f"hotd2re-win-{architecture}.zip"
+                    self.assertEqual(archive.name, expected_name)
+                    self.assertEqual(archive.with_name(archive.name + ".sha256").read_text(),
+                                     f"{release.sha256(archive)}  {expected_name}\n")
+                    package = archive.parent / "hotd2re"
+                    manifest = json.loads((package / "PACKAGE-MANIFEST.json").read_bytes())
+                    self.assertEqual(manifest["executable"]["releaseVersion"], "1.0")
+                    self.assertEqual(manifest["executable"]["buildLabel"], label)
+                    self.assertIn(f"Release 1.0 (Windows {architecture}).", (package / "README.txt").read_text())
+                    self.assertIn(f"Release version: 1.0\nBuild label: {label}\n", (package / "BUILD.txt").read_text())
+                    if kind == "public":
+                        index = json.loads((archive.parent / f"hotd2re-win-{architecture}.files.json").read_bytes())
+                        self.assertEqual(index["buildLabel"], label)
+                        self.assertEqual(json.loads(base64.b64decode(index["manifestBase64"]))["executable"]["releaseVersion"], "1.0")
+
+    def test_release_versions_reject_noncanonical_source_or_stale_executables(self):
+        source_path = self.source / "src/port/tools/play.cpp"
+        original_source = source_path.read_text()
+        original_binary = self.exe.read_bytes()
+        for version in ("0.0", "01.0", "1", "1.00", "1.10", "-1.0", "1.a", "1.0-beta", "", "1.0 "):
+            with self.subTest(version=version):
+                source_path.write_text(original_source + f'\nconst char* const kReleaseVersion = "{version}";\n')
+                with self.assertRaisesRegex(ValueError, "canonical major.minor"):
+                    release.executable_info(self.exe, self.source, "x86")
+        for version in ("1.0", "1.9", "2.0", "10.0"):
+            source_path.write_text(original_source + f'\nconst char* const kReleaseVersion = "{version}";\n')
+            self.exe.write_bytes(original_binary + version.encode("ascii") + b"\0")
+            self.assertEqual(release.executable_info(self.exe, self.source, "x86")["releaseVersion"], version)
+        source_path.write_text(original_source + '\nconst char* const kReleaseVersion = "1.0";\n')
+        for marker in (b"", b"1.1\0", b"1.0"):
+            with self.subTest(marker=marker):
+                self.exe.write_bytes(original_binary + marker)
+                with self.assertRaisesRegex(ValueError, "Executable release version does not match"):
+                    self.package()
+                self.assertFalse((self.root / "new-output").exists())
+        source_path.write_text(original_source + '\nconst char* const kReleaseVersion = GetVersion();\n')
+        with self.assertRaisesRegex(ValueError, "canonical major.minor"):
+            release.executable_info(self.exe, self.source, "x86")
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "PowerShell wrapper integration requires Windows")
+    def test_powershell_wrappers_default_to_x64_and_preserve_explicit_x86(self):
+        wrappers = self.root / "wrapper fixtures"
+        wrappers.mkdir()
+        (wrappers / "package_release.py").write_text("import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        for name, kind in (("make_dist.ps1", "public"), ("make_complete_dist.ps1", "complete")):
+            wrapper = wrappers / name
+            wrapper.write_bytes((release.REPO / "tools" / name).read_bytes())
+            for architecture in (None, "x86"):
+                with self.subTest(wrapper=name, architecture=architecture):
+                    arguments = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(wrapper),
+                                 "-Python", sys.executable, "-Out", str(self.root / "unused output")]
+                    if architecture:
+                        arguments += ["-Architecture", architecture]
+                    if kind == "complete":
+                        arguments += ["-GameDir", str(self.root / "unused game")]
+                    result = subprocess.run(arguments, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    forwarded = json.loads(result.stdout)
+                    self.assertEqual(forwarded[forwarded.index("--architecture") + 1], architecture or "x64")
+                    self.assertEqual(forwarded[forwarded.index("--kind") + 1], kind)
+        self.assertFalse((self.root / "unused output").exists())
+
+    def test_python_cli_defaults_to_x64_and_preserves_explicit_x86(self):
+        placeholder = self.root / "cli-result.zip"
+        placeholder.write_bytes(b"fixture")
+        for kind in ("public", "complete"):
+            for architecture in (None, "x86"):
+                with self.subTest(kind=kind, architecture=architecture):
+                    arguments = ["package_release.py", "--kind", kind]
+                    if architecture:
+                        arguments += ["--architecture", architecture]
+                    with patch.object(sys, "argv", arguments), patch.object(release, "stage_package", return_value=placeholder) as stage, patch("builtins.print"):
+                        self.assertEqual(release.main(), 0)
+                    selected = architecture or "x64"
+                    self.assertEqual(stage.call_args.kwargs["architecture"], selected)
+                    build = "build-x64" if selected == "x64" else "build"
+                    self.assertEqual(stage.call_args.kwargs["exe"], release.REPO / build / "src/port/Release/hotd2.exe")
+
+    def test_python_cli_forwards_explicit_typing_bank(self):
+        placeholder = self.root / "cli-result.zip"
+        placeholder.write_bytes(b"fixture")
+        arguments = ["package_release.py", "--kind", "complete", "--typing-reference", "build/fixture.bank"]
+        with patch.object(sys, "argv", arguments), patch.object(release, "stage_package", return_value=placeholder) as stage, patch("builtins.print"):
+            self.assertEqual(release.main(), 0)
+        self.assertEqual(stage.call_args.kwargs["typing_reference"], release.REPO / "build/fixture.bank")
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "PowerShell wrapper integration requires Windows")
+    def test_powershell_wrappers_forward_paths_and_preserve_existing_outputs(self):
+        output = self.root / "existing output with spaces"
+        output.mkdir()
+        marker = output / "keep.txt"
+        marker.write_bytes(b"keep this output")
+        for script in ("make_dist.ps1", "make_complete_dist.ps1"):
+            arguments = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(release.REPO / "tools" / script),
+                         "-Architecture", "x86", "-Exe", str(self.exe), "-SourceRoot", str(self.source), "-Out", str(output), "-Python", sys.executable]
+            if script == "make_complete_dist.ps1":
+                arguments += ["-GameDir", str(self.root / "not-read")]
+            result = subprocess.run(arguments, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Output already exists", result.stderr)
+            self.assertEqual(marker.read_bytes(), b"keep this output")
+            self.assertEqual(list(output.iterdir()), [marker])
+
+    def test_public_package_has_no_game_data_or_private_siblings(self):
+        (self.exe.parent / "hotd2re_save.bin").write_bytes(b"private")
+        (self.exe.parent / "typing_reference.bank").write_bytes(b"original mode data is never copied implicitly")
+        (self.exe.parent / "random-sdk-file.dll").write_bytes(b"not permitted")
+        (self.source / "game").mkdir()
+        (self.source / "game/Hod2.exe").write_bytes(b"original game is never copied")
+        archive = self.package()
+        self.assertEqual(archive.name, "hotd2re-win-x86.zip")
+        with zipfile.ZipFile(archive) as contents:
+            names = contents.namelist()
+            self.assertNotIn("hotd2re/game/Hod2.exe", names)
+            self.assertFalse(any(name.endswith("typing_reference.bank") for name in names))
+            self.assertFalse(any("save.bin" in name or "random-sdk" in name for name in names))
+            self.assertIn("hotd2re/game/PUT_YOUR_GAME_FILES_HERE.txt", names)
+        package = archive.parent / "hotd2re"
+        manifest = json.loads((package / "PACKAGE-MANIFEST.json").read_text())
+        self.assertFalse(manifest["originalGameDataIncluded"])
+        self.assertEqual(manifest["executable"]["architecture"], "x86")
+        self.assertNotIn("releaseVersion", manifest["executable"])
+        self.assertIn("Release 2026 10 19 NS32 (Windows x86).", (package / "README.txt").read_text())
+        self.assertIn("Release version: 2026 10 19 NS32\nBuild label: 2026 10 19 NS32\n", (package / "BUILD.txt").read_text())
+        for entry in manifest["files"]:
+            self.assertEqual(release.sha256(package / entry["path"]), entry["sha256"])
+        checks = (package / "SHA256SUMS.txt").read_text().splitlines()
+        self.assertTrue(any(line.endswith("  PACKAGE-MANIFEST.json") for line in checks))
+        for line in checks:
+            digest, relative = line.split("  ", 1)
+            self.assertEqual(release.sha256(package / relative), digest)
+        self.assertEqual((archive.parent / (archive.name + ".sha256")).read_text().split()[0], release.sha256(archive))
+        index = json.loads((archive.parent / "hotd2re-win-x86.files.json").read_bytes())
+        self.assertEqual({entry["path"] for entry in index["files"]}, {entry["path"] for entry in manifest["files"]})
+        self.assertFalse(any("save.bin" in entry["path"] or "random-sdk" in entry["path"] for entry in index["files"]))
+
+    def test_file_assets_reconstruct_the_exact_legacy_zip_payload(self):
+        for architecture in ("x86", "x64"):
+            with self.subTest(architecture=architecture):
+                exe = fake_pe(self.root / architecture / "hotd2.exe", architecture,
+                              "2026 10 19 NS64" if architecture == "x64" else "2026 10 19 NS32")
+                archive = self.package(architecture=architecture, exe=exe, out=self.root / architecture / "output")
+                package = archive.parent / "hotd2re"
+                index_path = archive.parent / f"hotd2re-win-{architecture}.files.json"
+                index = json.loads(index_path.read_bytes())
+                manifest_bytes = base64.b64decode(index["manifestBase64"], validate=True)
+                checksums_bytes = base64.b64decode(index["checksumsBase64"], validate=True)
+                self.assertEqual(manifest_bytes, (package / "PACKAGE-MANIFEST.json").read_bytes())
+                self.assertEqual(checksums_bytes, (package / "SHA256SUMS.txt").read_bytes())
+                manifest = json.loads(manifest_bytes)
+                self.assertEqual((index["format"], index["architecture"], index["buildLabel"]),
+                                 (1, architecture, manifest["executable"]["buildLabel"]))
+                self.assertEqual([{key: entry[key] for key in ("path", "bytes", "sha256")} for entry in index["files"]],
+                                 manifest["files"])
+                self.assertEqual(index_path.with_name(index_path.name + ".sha256").read_text(),
+                                 f"{release.sha256(index_path)}  {index_path.name}\n")
+                restored = {"PACKAGE-MANIFEST.json": manifest_bytes, "SHA256SUMS.txt": checksums_bytes}
+                for entry in index["files"]:
+                    blob = archive.parent / "file-assets" / f"hotd2re-file-{entry['sha256']}.gz"
+                    compressed = blob.read_bytes()
+                    self.assertEqual(len(compressed), entry["packedBytes"])
+                    self.assertEqual(hashlib.sha256(compressed).hexdigest(), entry["packedSha256"])
+                    restored[entry["path"]] = gzip.decompress(compressed)
+                    self.assertEqual(len(restored[entry["path"]]), entry["bytes"])
+                    self.assertEqual(hashlib.sha256(restored[entry["path"]]).hexdigest(), entry["sha256"])
+                self.assertIn("game/PUT_YOUR_GAME_FILES_HERE.txt", restored)
+                for line in checksums_bytes.decode("ascii").splitlines():
+                    digest, relative = line.split("  ", 1)
+                    self.assertEqual(hashlib.sha256(restored[relative]).hexdigest(), digest)
+                with zipfile.ZipFile(archive) as legacy_zip:
+                    self.assertIsNone(legacy_zip.testzip())
+                    self.assertEqual(set(legacy_zip.namelist()), {"hotd2re/" + name for name in restored})
+                    for name, data in restored.items():
+                        self.assertEqual(legacy_zip.read("hotd2re/" + name), data)
+
+    def test_file_assets_are_deterministic_and_deduplicate_identical_payloads(self):
+        (self.source / "LICENSE").write_bytes((self.source / "THIRD_PARTY_NOTICES.txt").read_bytes())
+        first = self.package(out=self.root / "first")
+        second = self.package(out=self.root / "second")
+        name = "hotd2re-win-x86.files.json"
+        self.assertEqual((first.parent / name).read_bytes(), (second.parent / name).read_bytes())
+        index = json.loads((first.parent / name).read_bytes())
+        entries = {entry["path"]: entry for entry in index["files"]}
+        self.assertEqual(entries["LICENSE-native-code.txt"]["sha256"], entries["THIRD_PARTY_NOTICES.txt"]["sha256"])
+        self.assertEqual(entries["LICENSE-native-code.txt"]["packedSha256"], entries["THIRD_PARTY_NOTICES.txt"]["packedSha256"])
+        blobs = list((first.parent / "file-assets").iterdir())
+        self.assertEqual(len(blobs), len({entry["sha256"] for entry in index["files"]}))
+        for blob in blobs:
+            data = blob.read_bytes()
+            self.assertEqual(data, (second.parent / "file-assets" / blob.name).read_bytes())
+            self.assertEqual(data[:4], b"\x1f\x8b\x08\x00")  # no original filename
+            self.assertEqual(data[4:8], b"\0" * 4)  # deterministic mtime
+
+        # The consumer bounds all rows even though shared blobs download once.
+        maximum = sum(entry["packedBytes"] for entry in index["files"]) - 1
+        self.assertLessEqual(sum(blob.stat().st_size for blob in blobs), maximum)
+        output = self.root / "compressed-limit"
+        output.mkdir()
+        manifest = json.loads((first.parent / "hotd2re/PACKAGE-MANIFEST.json").read_bytes())
+        with patch.object(release, "MAX_FILE_ASSETS_BYTES", maximum):
+            with self.assertRaisesRegex(ValueError, "compressed size limit"):
+                release.write_file_assets(first.parent / "hotd2re", output, manifest["executable"])
+        self.assertFalse((output / name).exists())
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "File-update consumer requires Windows PowerShell")
+    def test_python_file_assets_stage_with_windows_powershell_consumer(self):
+        (self.source / "src/port/tools/play.cpp").write_text(
+            'constexpr uint32_t kBuildId = 2026102400;\nconst char* const kBuildName = "2026 10 24 A";\n')
+        exe = fake_pe(self.root / "interop/hotd2.exe", "x64", "2026 10 24 A")
+        (self.source / "LICENSE").write_bytes((self.source / "THIRD_PARTY_NOTICES.txt").read_bytes())
+        archive = self.package(architecture="x64", exe=exe)
+        index = archive.parent / "hotd2re-win-x64.files.json"
+        installed = self.root / "isolated installation"
+        installed.mkdir()
+        script = self.root / "stage-file-update.ps1"
+        script.write_text(r'''param($Consumer, $Root, $Index, $Hash, $Assets)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. $Consumer
+$calls = [Collections.Generic.List[string]]::new()
+$download = {
+    param($Asset, $Destination, $MaximumBytes, $Description)
+    $calls.Add($Asset)
+    Copy-Item -LiteralPath (Join-Path $Assets $Asset) -Destination $Destination
+}.GetNewClosure()
+$payload = Expand-VerifiedFileUpdate -Root $Root -IndexPath $Index -ExpectedSha256 $Hash `
+    -Stage (Join-Path $Root '.hotd2-update/stage') -Architecture x64 -Tag 'v2026.10.24-a' -DownloadFile $download
+[pscustomobject]@{ payload = $payload; downloads = $calls.ToArray() } | ConvertTo-Json -Compress
+''', encoding="utf-8")
+        powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        result = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+             "-Consumer", str(release.REPO / "src/port/update/update_transaction.ps1"),
+             "-Root", str(installed), "-Index", str(index), "-Hash", release.sha256(index),
+             "-Assets", str(archive.parent / "file-assets")], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        output = json.loads(result.stdout)
+        payload = Path(output["payload"])
+        expected = {"hotd2re-file-" + entry["sha256"] + ".gz" for entry in json.loads(index.read_bytes())["files"]}
+        self.assertEqual(set(output["downloads"]), expected)
+        self.assertEqual(len(output["downloads"]), len(expected))
+        with zipfile.ZipFile(archive) as contents:
+            restored = {path.relative_to(payload).as_posix(): path.read_bytes() for path in payload.rglob("*") if path.is_file()}
+            self.assertEqual({"hotd2re/" + name for name in restored}, set(contents.namelist()))
+            for name, data in restored.items():
+                self.assertEqual(data, contents.read("hotd2re/" + name), name)
+
+    def test_file_assets_recheck_staged_payload_before_emitting_blobs(self):
+        archive = self.package()
+        package = archive.parent / "hotd2re"
+        manifest = json.loads((package / "PACKAGE-MANIFEST.json").read_bytes())
+        path = package / "hotd2.exe"
+        original = path.read_bytes()
+        for name, changed in (("same-size", bytes([original[0] ^ 1]) + original[1:]), ("wrong-size", original + b"x")):
+            with self.subTest(name=name):
+                path.write_bytes(changed)
+                output = self.root / name
+                output.mkdir()
+                with self.assertRaisesRegex(ValueError, "payload verification failed"):
+                    release.write_file_assets(package, output, manifest["executable"])
+                self.assertEqual(list(output.iterdir()), [])
+        path.write_bytes(original)
+
+    def test_file_asset_bounds_and_player_paths_are_rejected(self):
+        archive = self.package()
+        package = archive.parent / "hotd2re"
+        manifest_path = package / "PACKAGE-MANIFEST.json"
+        original = manifest_path.read_bytes()
+        manifest = json.loads(original)
+        records = manifest["files"]
+        index = archive.parent / "hotd2re-win-x86.files.json"
+        limits = (("MAX_PUBLIC_FILES", len(records) - 1, "payload count"),
+                  ("MAX_PUBLIC_FILE_BYTES", max(entry["bytes"] for entry in records) - 1, "payload size"),
+                  ("MAX_PUBLIC_TOTAL_BYTES", sum(entry["bytes"] for entry in records), "unpacked size limit"),
+                  ("MAX_FILE_INDEX_BYTES", index.stat().st_size - 1, "index exceeds"))
+        for constant, maximum, message in limits:
+            with self.subTest(limit=constant):
+                output = self.root / constant
+                output.mkdir()
+                with patch.object(release, constant, maximum), self.assertRaisesRegex(ValueError, message):
+                    release.write_file_assets(package, output, manifest["executable"])
+                self.assertFalse((output / index.name).exists())
+                self.assertFalse((output / (index.name + ".sha256")).exists())
+        for name in ("hotd2re_settings.ini", "game/Hod2.exe", "../outside.txt", "dxc-licenses/NUL.txt"):
+            with self.subTest(path=name):
+                manifest["files"] = records + [dict(path=name, bytes=0, sha256=hashlib.sha256(b"").hexdigest())]
+                manifest_path.write_text(json.dumps(manifest))
+                output = self.root / ("invalid-path-" + str(len(list(self.root.iterdir()))))
+                output.mkdir()
+                with self.assertRaisesRegex(ValueError, "payload path"):
+                    release.write_file_assets(package, output, manifest["executable"])
+                self.assertEqual(list(output.iterdir()), [])
+        manifest_path.write_bytes(original)
+
+    def test_optional_runtime_requires_matching_pe_and_all_notices(self):
+        exe = fake_pe(self.root / "vendor/hotd2.exe", "x64", "2026 10 19 NS64")
+        expected = []
+        for names, folder, required, _ in release.RUNTIME_GROUPS:
+            for name in names:
+                fake_pe(exe.parent / name, "x64", dll=True)
+                expected.append(name)
+            license_dir = exe.parent / folder
+            license_dir.mkdir(parents=True)
+            for name in (*required, "NOTICE-extra.md"):
+                (license_dir / name).write_text("Fixture runtime notice\n")
+        archive = self.package(exe=exe, architecture="x64")
+        with zipfile.ZipFile(archive) as contents:
+            for name in expected:
+                self.assertIn("hotd2re/" + name, contents.namelist())
+            for _, folder, required, _ in release.RUNTIME_GROUPS:
+                for name in (*required, "NOTICE-extra.md"):
+                    self.assertIn(f"hotd2re/{folder}/{name}", contents.namelist())
+
+    def test_missing_runtime_licenses_prevent_any_output(self):
+        fake_pe(self.exe.parent / "dxcompiler.dll", dll=True)
+        with self.assertRaisesRegex(ValueError, "DXC requires both"):
+            self.package()
+        self.assertFalse((self.root / "new-output").exists())
+        fake_pe(self.exe.parent / "dxil.dll", dll=True)
+        with self.assertRaises(ValueError):
+            self.package()
+        self.assertFalse((self.root / "new-output").exists())
+
+    def test_mismatched_runtime_architecture_is_rejected(self):
+        fake_pe(self.exe.parent / "dxcompiler.dll", "x64", dll=True)
+        fake_pe(self.exe.parent / "dxil.dll", "x64", dll=True)
+        with self.assertRaisesRegex(ValueError, "Runtime architecture"):
+            release.runtime_files(self.exe, "x86")
+
+    def test_unknown_runtime_home_path_is_rejected_before_staging(self):
+        for name in ("dxcompiler.dll", "dxil.dll"):
+            path = fake_pe(self.exe.parent / name, dll=True)
+            if name == "dxcompiler.dll":
+                with path.open("ab") as stream:
+                    stream.write(b"/home/local-developer/private/source.cpp\0")
+        licenses = self.exe.parent / "dxc-licenses"
+        licenses.mkdir()
+        for name in release.RUNTIME_GROUPS[-1][2]:
+            (licenses / name).write_text("Fixture license\n")
+        with self.assertRaisesRegex(ValueError, "privacy check failed"):
+            self.package()
+        self.assertFalse((self.root / "new-output").exists())
+
+    def test_offline_sdl_source_is_discovered_from_build_metadata(self):
+        original = self.source / "build/_deps/sdl3-src/LICENSE.txt"
+        external = self.root / "external-sdl"
+        external.mkdir()
+        original.rename(external / "LICENSE.txt")
+        (self.source / "build/CMakeCache.txt").write_text(f"FETCHCONTENT_SOURCE_DIR_SDL3:PATH={external.as_posix()}\n")
+        self.assertEqual(release.sdl_license(self.source, self.exe), external / "LICENSE.txt")
+
+    def game_manifest(self, entries=None):
+        directory = self.root / "separate-installation/game"
+        directory.mkdir(parents=True, exist_ok=True)
+        files = {name: ("synthetic fixture: " + name).encode() for name in sorted(release.REQUIRED_GAME_FILES)}
+        files["tex/model.bin"] = b"synthetic texture"
+        result = []
+        for name, data in files.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            result.append(dict(file=name.replace("/", "\\"), bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+        metadata = directory.parent / "original/game-manifest.json"
+        metadata.parent.mkdir()
+        metadata.write_text(json.dumps(entries if entries is not None else result))
+        return directory, metadata, result
+
+    def test_external_game_directory_and_manifest_validate_without_packaging(self):
+        directory, metadata, result = self.game_manifest()
+        result.append(dict(file="pol\\bg_adv19.bin", bytes=5, sha256="0" * 64))
+        metadata.write_text(json.dumps(result))
+        selected = release.verified_game_entries(directory, metadata)
+        self.assertEqual({name.casefold() for _, name, _, _ in selected},
+                         {"game/" + name for name in release.REQUIRED_GAME_FILES} | {"game/tex/model.bin"})
+        self.assertFalse(list(self.root.rglob("*.zip")))
+
+    def test_complete_archive_uses_stable_name_and_matching_checksum(self):
+        directory, metadata, entries = self.game_manifest()
+        for architecture in ("x86", "x64"):
+            with self.subTest(architecture=architecture):
+                exe = fake_pe(self.root / architecture / "hotd2.exe", architecture,
+                              "2026 10 19 NS64" if architecture == "x64" else "2026 10 19 NS32")
+                archive = self.package(kind="complete", architecture=architecture, exe=exe,
+                                       game_dir=directory, game_manifest=metadata,
+                                       out=self.root / ("complete-" + architecture))
+                self.assertEqual(archive.name, "hotd2re-complete.zip")
+                checksum = archive.with_name("hotd2re-complete.zip.sha256")
+                self.assertEqual(checksum.read_text(),
+                                 f"{release.sha256(archive)}  hotd2re-complete.zip\n")
+                self.assertFalse((archive.parent / "file-assets").exists())
+                self.assertFalse(list(archive.parent.glob("*.files.json*")))
+                with zipfile.ZipFile(archive) as contents:
+                    self.assertIsNone(contents.testzip())
+                    for entry in entries:
+                        relative = entry["file"].replace("\\", "/")
+                        self.assertEqual(contents.read("hotd2re/game/" + relative),
+                                         (directory / relative).read_bytes())
+                    manifest = json.loads(contents.read("hotd2re/PACKAGE-MANIFEST.json"))
+                    self.assertEqual(manifest["packageKind"], "complete")
+                    self.assertEqual(manifest["executable"]["architecture"], architecture)
+                    self.assertTrue(manifest["originalGameDataIncluded"])
+
+    def test_complete_package_includes_explicit_typing_bank_and_truthful_hash_metadata(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = fake_typing_reference(self.root / "reference.bank")
+        original = bank.read_bytes()
+        archive = self.package(kind="complete", game_dir=directory, game_manifest=metadata, typing_reference=bank)
+        with zipfile.ZipFile(archive) as contents:
+            relative = "game/typing_reference.bank"
+            self.assertEqual(contents.read("hotd2re/" + relative), original)
+            manifest = json.loads(contents.read("hotd2re/PACKAGE-MANIFEST.json"))
+            self.assertEqual(manifest["packageKind"], "complete")
+            self.assertTrue(manifest["originalGameDataIncluded"])
+            expected = dict(path=relative, format="TOTDREF1", version=5, complete=True,
+                            bytes=len(original), sha256=hashlib.sha256(original).hexdigest())
+            self.assertEqual(manifest["typingReference"], expected)
+            record = next(row for row in manifest["files"] if row["path"] == relative)
+            self.assertEqual(record, {key: expected[key] for key in ("path", "bytes", "sha256")})
+            self.assertIn(expected["sha256"] + "  " + relative,
+                          contents.read("hotd2re/SHA256SUMS.txt").decode())
+        self.assertEqual(bank.read_bytes(), original)
+        self.assertFalse((archive.parent / "file-assets").exists())
+
+    def test_public_package_refuses_explicit_typing_bank_without_reading_it(self):
+        with self.assertRaisesRegex(ValueError, "original game data.*complete packages"):
+            self.package(typing_reference=self.root / "does-not-exist.bank")
+        self.assertFalse((self.root / "new-output").exists())
+        self.assertIsNone(release.PUBLIC_MANAGED_PATH.fullmatch("game/typing_reference.bank"))
+
+    def test_typing_bank_version_completeness_bounds_and_truncation_are_checked_before_output(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = fake_typing_reference(self.root / "reference.bank")
+        original = bank.read_bytes()
+        cases = [("magic", b"NOT-REF1" + original[8:]),
+                 ("header", original[:43]), ("body", original[:-1]), ("trailing", original + b"unexpected")]
+        for name, offset, value in (("version", 8, 4), ("incomplete", 12, 0), ("issues", 16, 1), ("stages", 20, 17)):
+            changed = bytearray(original)
+            struct.pack_into("<I", changed, offset, value)
+            cases.append((name, changed))
+        for name, changed in cases:
+            with self.subTest(case=name):
+                bank.write_bytes(changed)
+                with self.assertRaises(ValueError):
+                    self.package(kind="complete", game_dir=directory, game_manifest=metadata, typing_reference=bank)
+                self.assertFalse((self.root / "new-output").exists())
+        bank.write_bytes(original)
+        with patch.object(release, "MAX_TYPING_REFERENCE_BYTES", len(original) - 1), self.assertRaisesRegex(ValueError, "reference size"):
+            self.package(kind="complete", game_dir=directory, game_manifest=metadata, typing_reference=bank)
+        self.assertFalse((self.root / "new-output").exists())
+
+    def test_typing_bank_privacy_is_checked_before_staging(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = fake_typing_reference(self.root / "reference.bank", b"/home/private-fixture/project/file.cpp\0")
+        with self.assertRaisesRegex(ValueError, "privacy check failed"):
+            self.package(kind="complete", game_dir=directory, game_manifest=metadata, typing_reference=bank)
+        self.assertFalse((self.root / "new-output").exists())
+
+    def test_typing_bank_copy_is_rehashed_before_archive_creation(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = fake_typing_reference(self.root / "reference.bank")
+        original_copy = release.shutil.copy2
+        def changed_copy(source, destination):
+            result = original_copy(source, destination)
+            if source == bank:
+                with Path(destination).open("ab") as stream:
+                    stream.write(b"changed after validation")
+            return result
+        with patch.object(release.shutil, "copy2", side_effect=changed_copy), self.assertRaisesRegex(ValueError, "changed during packaging"):
+            self.package(kind="complete", game_dir=directory, game_manifest=metadata, typing_reference=bank)
+        self.assertFalse(list((self.root / "new-output").glob("*.zip")))
+
+    def test_truncated_manifest_missing_boot_data_is_refused(self):
+        directory, metadata, result = self.game_manifest()
+        metadata.write_text(json.dumps([entry for entry in result if entry["file"].casefold() == "hod2.exe"]))
+        with self.assertRaisesRegex(ValueError, "missing required boot-data records"):
+            release.verified_game_entries(directory, metadata)
+        self.assertFalse(list(self.root.rglob("*.zip")))
+
+    def test_audio_bank_complete_staging_and_legacy_updater_separation(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = self.root / 'audio.bank'
+        bank.write_bytes(struct.pack('<8sII', b'H2NAUDIO', 1, 43) + bytes(1032))
+        pin = self.source / 'src/port/update/naomi_audio_content.h'
+        pin.parent.mkdir(exist_ok=True)
+        pin.write_text(f'constexpr uint64_t kNaomiAudioContentBytes = {bank.stat().st_size};\n'
+                       f'constexpr const char* kNaomiAudioContentSha256 = "{release.sha256(bank)}";\n')
+        with self.assertRaisesRegex(ValueError, 'require --naomi-audio'):
+            self.package(kind='complete', game_dir=directory, game_manifest=metadata)
+        with self.assertRaisesRegex(ValueError, 'original game data.*complete packages'):
+            self.package(naomi_audio=bank)
+        self.assertIsNone(release.PUBLIC_MANAGED_PATH.fullmatch('game/naomi_audio.bank'))
+        original = bank.read_bytes()
+        bank.write_bytes(original[:-1] + b'!')
+        with self.assertRaisesRegex(ValueError, 'pinned size and SHA-256'):
+            release.naomi_audio_info(bank, self.source)
+        bank.write_bytes(original)
+        shutil.copy2(bank, directory / 'naomi_audio.bank')
+        archive = self.package(kind='complete', game_dir=directory, game_manifest=metadata)
+        with zipfile.ZipFile(archive) as contents:
+            self.assertEqual(contents.read('hotd2re/game/naomi_audio.bank'), original)
+            manifest = json.loads(contents.read('hotd2re/PACKAGE-MANIFEST.json'))
+            self.assertEqual(manifest['naomiAudio'], release.naomi_audio_info(bank, self.source))
+
+    def naomi_bank(self, payload=b"synthetic Naomi fixture"):
+        bank = self.root / "visuals.bank"
+        bank.write_bytes(struct.pack("<8s6I", b"H2NVIS01", 2, len(payload), zlib.crc32(payload), 1, 0, 0) + payload)
+        self.pin_naomi_bank(bank)
+        return bank
+
+    def pin_naomi_bank(self, bank):
+        header = self.source / "src/port/update/naomi_content.h"
+        header.parent.mkdir(exist_ok=True)
+        header.write_text(f'constexpr uint64_t kNaomiContentBytes = {bank.stat().st_size};\n'
+                          f'constexpr const char* kNaomiContentSha256 = "{release.sha256(bank)}";\n')
+
+    def test_naomi_complete_package_matches_runtime_pin_and_manifest(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = self.naomi_bank()
+        archive = self.package(kind="complete", game_dir=directory, game_manifest=metadata, naomi_visuals=bank)
+        with zipfile.ZipFile(archive) as contents:
+            self.assertEqual(contents.read("hotd2re/game/naomi_visuals.bank"), bank.read_bytes())
+            manifest = json.loads(contents.read("hotd2re/PACKAGE-MANIFEST.json"))
+            self.assertEqual(manifest["naomiVisuals"], release.naomi_visuals_info(bank, self.source))
+            self.assertIn({key: manifest["naomiVisuals"][key] for key in ("path", "bytes", "sha256")}, manifest["files"])
+        self.assertFalse((archive.parent / "file-assets").exists())
+
+    def test_public_package_rejects_naomi_without_reading_or_staging_it(self):
+        with self.assertRaisesRegex(ValueError, "original game data.*complete packages"):
+            self.package(naomi_visuals=self.root / "missing.bank")
+        self.assertFalse((self.root / "new-output").exists())
+        self.assertIsNone(release.PUBLIC_MANAGED_PATH.fullmatch("game/naomi_visuals.bank"))
+
+    def test_complete_naomi_client_requires_bank_and_discovers_verified_installed_bank(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = self.naomi_bank()
+        with self.assertRaisesRegex(ValueError, "require --naomi-visuals"):
+            self.package(kind="complete", game_dir=directory, game_manifest=metadata)
+        self.assertFalse((self.root / "new-output").exists())
+        shutil.copy2(bank, directory / "naomi_visuals.bank")
+        archive = self.package(kind="complete", game_dir=directory, game_manifest=metadata)
+        with zipfile.ZipFile(archive) as contents:
+            self.assertEqual(contents.read("hotd2re/game/naomi_visuals.bank"), bank.read_bytes())
+
+    def test_naomi_corruption_pin_and_envelope_are_checked_before_output(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = self.naomi_bank()
+        original = bank.read_bytes()
+        for broken in (original[:-1], original[:-1] + b"X"):
+            bank.write_bytes(broken)
+            with self.assertRaisesRegex(ValueError, "pinned size and SHA-256"):
+                self.package(kind="complete", game_dir=directory, game_manifest=metadata, naomi_visuals=bank)
+            self.assertFalse((self.root / "new-output").exists())
+        for offset, value, message in ((8, 1, "header"), (12, 0, "header"), (16, 0, "CRC"), (20, 0, "header")):
+            broken = bytearray(original)
+            struct.pack_into("<I", broken, offset, value)
+            bank.write_bytes(broken)
+            self.pin_naomi_bank(bank)
+            with self.assertRaisesRegex(ValueError, message):
+                self.package(kind="complete", game_dir=directory, game_manifest=metadata, naomi_visuals=bank)
+            self.assertFalse((self.root / "new-output").exists())
+
+    def test_naomi_bank_is_rehashed_after_copy(self):
+        directory, metadata, _ = self.game_manifest()
+        bank = self.naomi_bank()
+        original_copy = release.shutil.copy2
+        def changed_copy(source, destination):
+            result = original_copy(source, destination)
+            if source == bank:
+                with Path(destination).open("ab") as stream:
+                    stream.write(b"changed during copy")
+            return result
+        with patch.object(release.shutil, "copy2", side_effect=changed_copy), self.assertRaisesRegex(ValueError, "changed during packaging"):
+            self.package(kind="complete", game_dir=directory, game_manifest=metadata, naomi_visuals=bank)
+        self.assertFalse(list((self.root / "new-output").glob("*.zip")))
+
+    def test_game_paths_duplicates_and_hashes_are_checked(self):
+        directory, metadata, result = self.game_manifest()
+        for bad in (dict(file="tex\\..\\..\\private.txt", bytes=0, sha256="0" * 64), result[0],
+                    dict(file="tex/model.bin", bytes=17, sha256="0" * 64)):
+            metadata.write_text(json.dumps(result + [bad]))
+            with self.assertRaises((ValueError, OSError)):
+                release.verified_game_entries(directory, metadata)
+        damaged = [dict(entry) for entry in result]
+        damaged[0]["sha256"] = "0" * 64
+        metadata.write_text(json.dumps(damaged))
+        with self.assertRaisesRegex(ValueError, "differs from"):
+            release.verified_game_entries(directory, metadata)
+
+
+if __name__ == "__main__":
+    unittest.main()
