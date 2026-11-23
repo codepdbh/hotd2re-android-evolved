@@ -270,6 +270,7 @@ private:
     std::array<float,16> previousTemporalView_ = {}, previousTemporalProjection_ = {};
     int previousTemporalWidth_ = 0, previousTemporalHeight_ = 0;
     bool haveTemporalHistory_ = false, temporalActive_ = false, temporalReset_ = false;
+    size_t gameListDraws_ = 0, gameListModels_ = 0, gameListSprites_ = 0, gameListPrelit_ = 0; // high-water marks
 };
 
 }  // namespace port

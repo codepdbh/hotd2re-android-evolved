@@ -573,6 +573,12 @@ void ModelRenderer::AddMotionDraw(GpuDrawList& list, const Batch& batch, const G
 }
 
 void ModelRenderer::SubmitGame(GpuDrawList& list) {
+    // Remember this frame's sizes, so the next list allocates once instead of regrowing
+    // (and copying its >1 KB model constants) while it is built.
+    gameListDraws_ = std::max(gameListDraws_, list.draws.size());
+    gameListModels_ = std::max(gameListModels_, list.model.size());
+    gameListSprites_ = std::max(gameListSprites_, list.sprite.size());
+    gameListPrelit_ = std::max(gameListPrelit_, list.naomiPrelitVertices.size());
     if (device_->RequiresSceneProcessing()) {
         GpuDrawList hud;
         hud.width=list.width; hud.height=list.height; hud.sprite=list.sprite;
@@ -986,6 +992,10 @@ void ModelRenderer::DrawGame(int width, int height, const float viewProj[16], co
     fc.flags[1] = 1;  // unlit
 
     GpuDrawList out;
+    out.draws.reserve(gameListDraws_);
+    out.model.reserve(gameListModels_);
+    out.sprite.reserve(gameListSprites_);
+    out.naomiPrelitVertices.reserve(gameListPrelit_);
     std::vector<size_t> nativeFlashDraws;
     std::vector<uint8_t> nativeOpaqueSprites(sprites?sprites->size():0,0);
     out.width = width;

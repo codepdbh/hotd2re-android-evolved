@@ -39,20 +39,31 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class DataActivity extends Activity {
     private static final int PICK_DATA = 1;
+    private static final int PICK_DRIVER = 2;
+    private static final String DRIVER_SETTING = "vulkan_driver";
+    private static final String DRIVER_STATE = "vulkan-driver.state";
+    private static final String GPU_INFO = "gpu-info.txt";
     private static final String SCENE = "scenes/st1_play.scene";
     private static final String VIEWPORT_SETTING = "display_format";
+    private static final String RESOLUTION_SETTING = "render_resolution";
+    private static final String GRAPHICS_MODE_SETTING = "graphics_mode";
     private static final String AUDIO_SETTING = "game_audio";
     private static final String LANGUAGE_PREFS = "launcher_language";
     private static final String LANGUAGE_SETTING = "language";
     private static final String[] LANGUAGES = {"es", "en"};
     private static final String[] VIEWPORTS = {"4:3", "16:9", "window"};
+    private static final int[] RENDER_HEIGHTS = {360, 480, 960};
+    private static final String[] GRAPHICS_MODES = {null, "pc", "naomi"};
     private static final int TEXT = 0xFFF8EDE2;
     private static final int MUTED = 0xFFC7B9AF;
     private static final int GOLD = 0xFFE4BC85;
@@ -64,8 +75,14 @@ public final class DataActivity extends Activity {
     private Button play;
     private Button online;
     private Spinner displayFormat;
+    private Spinner renderResolution;
+    private Spinner graphicsMode;
     private Spinner language;
     private Switch audio;
+    private Spinner driver;
+    private Button removeDriver;
+    private TextView gpuInfo;
+    private List<VulkanDrivers.Driver> drivers = new ArrayList<>();
     private int languageIndex;
 
     @Override
@@ -158,18 +175,39 @@ public final class DataActivity extends Activity {
             public void onNothingSelected(AdapterView<?> parent) {}
         });
 
-        displayFormat = addSelector(options, R.string.launcher_format, getResources().getStringArray(R.array.launcher_formats));
-        int savedFormat = settings.getInt(VIEWPORT_SETTING, 0);
-        displayFormat.setSelection(savedFormat >= 0 && savedFormat < VIEWPORTS.length ? savedFormat : 0);
-        displayFormat.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+        displayFormat = addSavedSelector(options, R.string.launcher_format, R.array.launcher_formats, VIEWPORT_SETTING, 0);
+        renderResolution = addSavedSelector(options, R.string.launcher_resolution, R.array.launcher_resolutions, RESOLUTION_SETTING, 1);
+        graphicsMode = addSavedSelector(options, R.string.launcher_graphics_mode, R.array.launcher_graphics_modes, GRAPHICS_MODE_SETTING, 0);
+
+        driver = addSelector(options, R.string.driver_label, new String[0]);
+        driver.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                settings.edit().putInt(VIEWPORT_SETTING, position).apply();
+                String selected = position <= 0 || position > drivers.size() ? VulkanDrivers.SYSTEM : drivers.get(position - 1).id;
+                settings.edit().putString(DRIVER_SETTING, selected).apply();
+                removeDriver.setEnabled(position > 0);
             }
 
             @Override
             public void onNothingSelected(AdapterView<?> parent) {}
         });
+        LinearLayout driverActions = new LinearLayout(this);
+        Button installDriver = action(getString(R.string.driver_install), 0, false);
+        installDriver.setTextSize(14);
+        installDriver.setOnClickListener(view -> pickDriver());
+        removeDriver = action(getString(R.string.driver_remove), 0, false);
+        removeDriver.setTextSize(14);
+        removeDriver.setOnClickListener(view -> confirmRemoveDriver());
+        driverActions.addView(installDriver, new LinearLayout.LayoutParams(0, dp(48), 1.3f));
+        LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(0, dp(48), 1);
+        removeParams.setMarginStart(dp(8));
+        driverActions.addView(removeDriver, removeParams);
+        addRow(options, driverActions, 6);
+        gpuInfo = text("", 12, MUTED);
+        addRow(options, gpuInfo, 6);
+        TextView driverHelp = text(getString(R.string.driver_help), 12, MUTED);
+        addRow(options, driverHelp, 4);
+        refreshDrivers();
 
         View divider = new View(this);
         divider.setBackgroundColor(0xFF493633);
@@ -224,6 +262,24 @@ public final class DataActivity extends Activity {
         view.setTextSize(size);
         view.setTextColor(color);
         return view;
+    }
+
+    private Spinner addSavedSelector(LinearLayout panel, int labelRes, int choicesRes, String preference, int fallback) {
+        String[] choices = getResources().getStringArray(choicesRes);
+        Spinner selector = addSelector(panel, labelRes, choices);
+        SharedPreferences settings = getPreferences(MODE_PRIVATE);
+        int saved = settings.getInt(preference, fallback);
+        selector.setSelection(saved >= 0 && saved < choices.length ? saved : fallback);
+        selector.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                settings.edit().putInt(preference, position).apply();
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        return selector;
     }
 
     private Spinner addSelector(LinearLayout panel, int labelRes, String[] choices) {
@@ -294,6 +350,121 @@ public final class DataActivity extends Activity {
         online.setEnabled(available);
     }
 
+    private void refreshDrivers() {
+        drivers = VulkanDrivers.installed(files);
+        List<String> labels = new ArrayList<>();
+        labels.add(getString(R.string.driver_system));
+        for (VulkanDrivers.Driver installed : drivers) labels.add(installed.label());
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        driver.setAdapter(adapter);
+        String saved = getPreferences(MODE_PRIVATE).getString(DRIVER_SETTING, VulkanDrivers.SYSTEM);
+        int selection = 0;
+        for (int i = 0; i < drivers.size(); ++i) if (drivers.get(i).id.equals(saved)) selection = i + 1;
+        driver.setSelection(selection);
+        removeDriver.setEnabled(selection > 0);
+        String info = readSmallFile(GPU_INFO);
+        gpuInfo.setText(info.isEmpty() ? getString(R.string.driver_gpu_unknown) : getString(R.string.driver_gpu, info));
+    }
+
+    private String readSmallFile(String name) {
+        try {
+            Path path = files.resolve(name);
+            if (!Files.isRegularFile(path) || Files.size(path) > 4096) return "";
+            return new String(Files.readAllBytes(path), StandardCharsets.UTF_8).trim();
+        } catch (IOException error) {
+            return "";
+        }
+    }
+
+    // The engine leaves this file behind when a custom driver failed, or when the game
+    // closed before presenting its first frames. Return to the system driver in both cases.
+    private void checkDriverState() {
+        String state = readSmallFile(DRIVER_STATE);
+        if (state.isEmpty()) return;
+        try {
+            Files.deleteIfExists(files.resolve(DRIVER_STATE));
+        } catch (IOException ignored) {
+            // A stale file only repeats this notice.
+        }
+        String[] lines = state.split("\n", 2);
+        String detail = lines.length > 1 ? lines[1].trim() : "";
+        GameDiagnostics.record(this, "Custom Vulkan driver " + lines[0] + (detail.isEmpty() ? "" : ": " + detail));
+        getPreferences(MODE_PRIVATE).edit().putString(DRIVER_SETTING, VulkanDrivers.SYSTEM).apply();
+        refreshDrivers();
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.driver_failed_title)
+                .setMessage(getString("failed".equals(lines[0]) ? R.string.driver_failed : R.string.driver_crashed)
+                        + (detail.isEmpty() ? "" : "\n\n" + detail))
+                .setPositiveButton(R.string.launcher_ok, null).show();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (driver != null) {
+            refreshDrivers();
+            checkDriverState();
+        }
+    }
+
+    private void pickDriver() {
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        try {
+            startActivityForResult(picker, PICK_DRIVER);
+        } catch (ActivityNotFoundException error) {
+            Toast.makeText(this, R.string.launcher_no_picker, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void installDriver(Uri document) {
+        Toast.makeText(this, R.string.driver_installing, Toast.LENGTH_SHORT).show();
+        worker.execute(() -> {
+            try {
+                VulkanDrivers.Driver installed = VulkanDrivers.install(getContentResolver(), document, files);
+                GameDiagnostics.record(this, "Installed Vulkan driver " + installed.name + " (" + installed.library + ")");
+                runOnUiThread(() -> {
+                    getPreferences(MODE_PRIVATE).edit().putString(DRIVER_SETTING, installed.id).apply();
+                    refreshDrivers();
+                    Toast.makeText(this, getString(R.string.driver_installed, installed.name), Toast.LENGTH_LONG).show();
+                });
+            } catch (IOException | RuntimeException error) {
+                int message = error instanceof VulkanDrivers.Failure
+                        ? ((VulkanDrivers.Failure) error).message : R.string.driver_unreadable;
+                Log.e("HOTD2RE", "Vulkan driver import failed", error);
+                GameDiagnostics.record(this, "Vulkan driver import failed: " + getResources().getResourceEntryName(message));
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    new AlertDialog.Builder(this)
+                            .setTitle(R.string.driver_install)
+                            .setMessage(message)
+                            .setPositiveButton(R.string.launcher_ok, null).show();
+                });
+            }
+        });
+    }
+
+    private void confirmRemoveDriver() {
+        int position = driver.getSelectedItemPosition();
+        if (position <= 0 || position > drivers.size()) return;
+        VulkanDrivers.Driver selected = drivers.get(position - 1);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.driver_remove)
+                .setMessage(getString(R.string.driver_remove_confirm, selected.name))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.driver_remove, (dialog, which) -> {
+                    try {
+                        VulkanDrivers.delete(selected);
+                    } catch (IOException error) {
+                        Log.e("HOTD2RE", "Could not delete the Vulkan driver", error);
+                    }
+                    getPreferences(MODE_PRIVATE).edit().putString(DRIVER_SETTING, VulkanDrivers.SYSTEM).apply();
+                    refreshDrivers();
+                }).show();
+    }
+
     private void pick() {
         Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
         picker.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
@@ -308,6 +479,10 @@ public final class DataActivity extends Activity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == PICK_DRIVER && result == RESULT_OK && data != null && data.getData() != null) {
+            installDriver(data.getData());
+            return;
+        }
         if (request != PICK_DATA || result != RESULT_OK || data == null) return;
         Uri tree = data.getData();
         if (tree == null || !DocumentsContract.isTreeUri(tree)) return;
@@ -343,10 +518,23 @@ public final class DataActivity extends Activity {
             Files.createDirectories(scene.getParent());
             Files.copy(input, scene, StandardCopyOption.REPLACE_EXISTING);
             int selection = Math.max(0, displayFormat.getSelectedItemPosition());
+            int renderHeight = RENDER_HEIGHTS[Math.max(0, renderResolution.getSelectedItemPosition())];
+            String mode = GRAPHICS_MODES[Math.max(0, graphicsMode.getSelectedItemPosition())];
+            VulkanDrivers.Driver custom = VulkanDrivers.find(files,
+                    getPreferences(MODE_PRIVATE).getString(DRIVER_SETTING, VulkanDrivers.SYSTEM));
             GameDiagnostics.record(this, "Launch " + (openOnline ? "online" : "game") + ", display " + VIEWPORTS[selection]
-                    + ", audio " + (audio.isChecked() ? "on" : "off"));
-            startActivity(new Intent(this, GameActivity.class)
+                    + ", render height " + renderHeight + ", graphics " + (mode == null ? "game setting" : mode)
+                    + ", audio " + (audio.isChecked() ? "on" : "off")
+                    + ", Vulkan driver " + (custom == null ? "system" : custom.name + " (" + custom.library + ")"));
+            Intent game = new Intent(this, GameActivity.class);
+            if (custom != null) {
+                game.putExtra(GameActivity.EXTRA_DRIVER_DIRECTORY, custom.directory.toString())
+                        .putExtra(GameActivity.EXTRA_DRIVER_LIBRARY, custom.library);
+            }
+            startActivity(game
                     .putExtra(GameActivity.EXTRA_VIEWPORT, VIEWPORTS[selection])
+                    .putExtra(GameActivity.EXTRA_RENDER_HEIGHT, renderHeight)
+                    .putExtra(GameActivity.EXTRA_GRAPHICS_MODE, mode)
                     .putExtra(GameActivity.EXTRA_AUDIO, audio.isChecked())
                     .putExtra(GameActivity.EXTRA_ONLINE, openOnline));
         } catch (IOException error) {

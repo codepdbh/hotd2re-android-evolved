@@ -5,7 +5,11 @@
         android:version="0x00400000" android:required="true" />
     <application android:label="The House of the Dead 2 — Android Evolved" android:allowBackup="false"
         android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
-        android:theme="@android:style/Theme.Material.NoActionBar" android:enableOnBackInvokedCallback="false">
+        android:theme="@android:style/Theme.Material.NoActionBar" android:enableOnBackInvokedCallback="false"
+        android:appCategory="game" android:isGame="true">
+        <!-- Lets Android Game Mode and the GPU/CPU profilers recognise the game. -->
+        <profileable android:shell="true" />
+        <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
         <activity android:name=".DataActivity" android:exported="true"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden">
             <intent-filter>

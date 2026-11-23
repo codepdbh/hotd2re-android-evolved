@@ -383,10 +383,18 @@ float4 ModelColor(VSOut i) {
 #else
 float4 psmain(VSOut i) : SV_Target {
 #endif
+#ifdef PLAIN_MODEL
+    float4 t = flags.x > 0.5 ? tex.Sample(samp, i.uv) : float4(1, 1, 1, 1);
+#else
     float4 t = flags.x > 0.5 ? ModelSample(i.uv) : float4(1, 1, 1, 1);
+#endif
     float a = SourceMaterialAlpha(t.a,diffuse.a,flags.w,flags.x > 0.5);
+#ifndef PLAIN_MODEL
     a = SoftOpacity(i,a);
+#endif
+#ifndef NO_ALPHA_TEST
     if (flags.z >= 0) clip(a - flags.z);
+#endif
     if (flags.w >= 16 && flags.x > 0.5) {
         int instruction = ((int)flags.w - 16) & 3;
         float3 face = litDir.w > 0.5 ? i.lit.rgb : diffuse.rgb;
@@ -394,7 +402,9 @@ float4 psmain(VSOut i) : SV_Target {
             ? lerp(face,t.rgb,SourceTextureAlpha(t.a,flags.w)) : face*t.rgb;
         return float4(Fog(saturate(color+i.spec.rgb),i.depth),a);
     }
+#ifndef PLAIN_MODEL
     if (lightingOptions.x > 0.5 && litDir.w > 0.5) return float4(Fog(PixelLighting(i, t.rgb), i.depth), a);
+#endif
     if (litDir.w > 0.5) return float4(Fog(saturate(t.rgb * i.lit.rgb + i.spec.rgb), i.depth), a);  // Gouraud colour (vsmain)
     float3 c = diffuse.rgb * t.rgb;
     float l = flags.y > 0.5 ? 1.0 : 0.35 + 0.65 * abs(dot(normalize(i.nrm), lightDir.xyz));
@@ -535,6 +545,9 @@ float3 FxaaSample(float2 uv) {
     return lb < lo || lb > hi ? a : b;
 }
 float4 psmain(VSOut i) : SV_Target {
+#ifdef PLAIN_PRESENT
+    return float4(saturate(SharpSample(i.uv)), 1.0);
+#else
     float2 uv=i.uv;
     if(crt.y>0){float2 p=uv*2-1;uv=(p*(1+crt.y*dot(p,p))+1)*.5;
         if(any(uv<0)||any(uv>1))return float4(0,0,0,1);}
@@ -599,6 +612,7 @@ float4 psmain(VSOut i) : SV_Target {
         return float4(linearColor*hdr.y,1.0);
     }
     return float4(saturate(c), 1.0);
+#endif
 }
 )";
 

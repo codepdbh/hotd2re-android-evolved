@@ -223,9 +223,43 @@ if(HOTD2_SDL3)
 
   # play.exe - playable game on the native world (game mode 6): gun input, gameplay HUD, sound.
   if(ANDROID)
+    # Custom Vulkan drivers (Turnip, PanVK, other Mesa builds). libadrenotools hooks the
+    # system loader's "vulkan.*.so" HAL load, so it is not limited to Adreno GPUs.
+    include(FetchContent)
+    FetchContent_Declare(adrenotools
+      URL https://github.com/bylaws/libadrenotools/archive/8fae8ce254dfc1344527e05301e43f37dea2df80.tar.gz
+      URL_HASH SHA256=ceffce971676d4cfdf348a082df06fc92a1dca6d95bea892a480d63f200961cb
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR hotd2-sources-only)
+    FetchContent_Declare(linkernsbypass
+      URL https://github.com/bylaws/liblinkernsbypass/archive/aa3975893d83ef1bc84c321ec60c65fbf1287887.tar.gz
+      URL_HASH SHA256=da1128c8aa771c4d24766b53a47822d0717baa5c536ca8491220402942b80638
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR hotd2-sources-only)
+    # Their own CMake projects are not used; SOURCE_SUBDIR only downloads the sources.
+    FetchContent_MakeAvailable(adrenotools linkernsbypass)
+    add_library(hotd2_linkernsbypass STATIC
+      ${linkernsbypass_SOURCE_DIR}/android_linker_ns.cpp ${linkernsbypass_SOURCE_DIR}/elf_soname_patcher.cpp)
+    target_include_directories(hotd2_linkernsbypass PUBLIC ${linkernsbypass_SOURCE_DIR})
+    target_link_libraries(hotd2_linkernsbypass PUBLIC android dl)
+    set_target_properties(hotd2_linkernsbypass PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_library(hotd2_adrenotools STATIC ${adrenotools_SOURCE_DIR}/src/driver.cpp)
+    target_include_directories(hotd2_adrenotools PUBLIC ${adrenotools_SOURCE_DIR}/include PRIVATE ${adrenotools_SOURCE_DIR}/src)
+    target_link_libraries(hotd2_adrenotools PUBLIC hotd2_linkernsbypass log)
+    set_target_properties(hotd2_adrenotools PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    # The hooks are loaded by name from nativeLibraryDir (useLegacyPackaging).
+    add_library(hook_impl SHARED ${adrenotools_SOURCE_DIR}/src/hook/hook_impl.cpp)
+    target_include_directories(hook_impl PRIVATE ${adrenotools_SOURCE_DIR}/include)
+    target_link_libraries(hook_impl PRIVATE hotd2_linkernsbypass log)
+    set_target_properties(hook_impl PROPERTIES CXX_VISIBILITY_PRESET hidden)
+    add_library(main_hook SHARED ${adrenotools_SOURCE_DIR}/src/hook/main_hook.c)
+    target_link_options(main_hook PRIVATE -z global)
+    target_link_libraries(main_hook PRIVATE hook_impl)
+    # SDL loads this by path (SDL_HINT_VULKAN_LIBRARY); it forwards to the custom loader instance.
+    add_library(hotd2_vulkan_shim SHARED platform/android_vulkan_shim.c)
+
     add_library(hotd2_android SHARED tools/play.cpp platform/android_entry.cpp)
     set_target_properties(hotd2_android PROPERTIES OUTPUT_NAME main)
-    target_link_libraries(hotd2_android PRIVATE port_platform game_hud port_play port_net port_update log)
+    target_link_libraries(hotd2_android PRIVATE port_platform game_hud port_play port_net port_update hotd2_adrenotools log)
+    add_dependencies(hotd2_android main_hook hook_impl hotd2_vulkan_shim)
   else()
     add_executable(play tools/play.cpp)
     target_link_libraries(play PRIVATE port_platform game_hud port_play port_net port_update)

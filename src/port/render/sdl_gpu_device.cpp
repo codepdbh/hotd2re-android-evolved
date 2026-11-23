@@ -3,9 +3,11 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "asset_store.h"
@@ -124,7 +126,9 @@ private:
     SDL_GPUGraphicsPipeline* AoPipeline();
     void DrawPost(PostTarget&,SDL_GPUGraphicsPipeline*,SDL_GPUTexture*,SDL_GPUTexture*,SDL_GPUTexture*,const float cb[8]);
     SDL_GPUTexture* PostSource(int outWidth,int outHeight,int* sourceWidth,int* sourceHeight,bool* fsr);
-    SDL_GPUGraphicsPipeline* Pipeline(GpuDraw::Pipeline kind, const GpuState& s, bool coverage = false);
+    enum class ModelShader { Full, Plain, NoAlphaTest };
+    SDL_GPUGraphicsPipeline* Pipeline(GpuDraw::Pipeline kind, const GpuState& s, bool coverage = false,
+                                      ModelShader modelShader = ModelShader::Full);
     SDL_GPUSampler* Sampler(const GpuState& s);
     // Uploads bytes into a GPU buffer through a transfer buffer, in its own command buffer (immediate) or a copy pass.
     bool Upload(SDL_GPUCopyPass* pass, SDL_GPUBuffer* dst, const void* data, uint32_t bytes, bool cycle);
@@ -143,12 +147,18 @@ private:
     SDL_GPUShader* modelVs_ = nullptr;
     SDL_GPUShader* naomiPrelitVs_ = nullptr;
     SDL_GPUShader* modelPs_ = nullptr;
+    SDL_GPUShader* plainModelPs_ = nullptr;
+    SDL_GPUShader* opaqueModelPs_ = nullptr;
     SDL_GPUShader* spriteVs_ = nullptr;
     SDL_GPUShader* spritePs_ = nullptr;
     // the present pass (window): kPresentShaderHlsl into the swap chain texture, present_'s rectangle as the viewport
     SDL_GPUShader* presentVs_ = nullptr;
     SDL_GPUShader* presentPs_ = nullptr;
     SDL_GPUGraphicsPipeline* presentPipe_ = nullptr;
+#ifdef HOTD2_SDL_GPU_SPIRV
+    SDL_GPUShader* plainPresentPs_ = nullptr;
+    SDL_GPUGraphicsPipeline* plainPresentPipe_ = nullptr;
+#endif
     SDL_GPUGraphicsPipeline* presentHdrPipe_ = nullptr;
     SDL_GPUSampler* presentSampler_ = nullptr;
     SDL_GPUSampler* postPointSampler_ = nullptr;
@@ -195,6 +205,8 @@ private:
     GraphicsOptions graphics_;
     mutable GraphicsCapabilities capabilities_;
     SDL_GPUPresentMode presentMode_ = SDL_GPU_PRESENTMODE_VSYNC;
+    uint32_t presentedFrames_ = 0;
+    std::unique_ptr<ModelConstants> lastModelUniforms_;
     SDL_GPUTexture* acquiredSwap_ = nullptr;
     Uint32 acquiredWidth_ = 0, acquiredHeight_ = 0;
     std::map<uint32_t, SDL_GPUGraphicsPipeline*> pipelines_;
@@ -268,6 +280,10 @@ SdlGpuDevice::~SdlGpuDevice() {
     for(auto* pipeline:shadowMapPipelines_)if(pipeline)SDL_ReleaseGPUGraphicsPipeline(dev_,pipeline);
     for (auto& [k, p] : pipelines_) SDL_ReleaseGPUGraphicsPipeline(dev_, p);
     if (presentPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, presentPipe_);
+#ifdef HOTD2_SDL_GPU_SPIRV
+    if (plainPresentPipe_) SDL_ReleaseGPUGraphicsPipeline(dev_, plainPresentPipe_);
+    if (plainPresentPs_) SDL_ReleaseGPUShader(dev_, plainPresentPs_);
+#endif
     if(presentHdrPipe_)SDL_ReleaseGPUGraphicsPipeline(dev_,presentHdrPipe_);
     if (presentSampler_) SDL_ReleaseGPUSampler(dev_, presentSampler_);
     if (postPointSampler_) SDL_ReleaseGPUSampler(dev_,postPointSampler_);
@@ -298,7 +314,7 @@ SdlGpuDevice::~SdlGpuDevice() {
         if (b) SDL_ReleaseGPUBuffer(dev_, b);
     if (transfer_) SDL_ReleaseGPUTransferBuffer(dev_, transfer_);
     if (readback_) SDL_ReleaseGPUTransferBuffer(dev_, readback_);
-    for (SDL_GPUShader* s : { modelVs_, naomiPrelitVs_, modelPs_, spriteVs_, spritePs_, presentVs_, presentPs_ })
+    for (SDL_GPUShader* s : { modelVs_, naomiPrelitVs_, modelPs_, plainModelPs_, opaqueModelPs_, spriteVs_, spritePs_, presentVs_, presentPs_ })
         if (s) SDL_ReleaseGPUShader(dev_, s);
     if (window_) SDL_ReleaseWindowFromGPUDevice(dev_, window_);
     SDL_DestroyGPUDevice(dev_);
@@ -323,10 +339,58 @@ bool SdlGpuDevice::Init(const GpuDeviceDesc& desc, std::string* error) {
         if (error) *error = "SDL_GPU: no shader blobs for this platform yet (needs SPIR-V / MSL builds of hlsl_shaders.h)";
         return false;
     }
+#ifdef __ANDROID__
+    if (SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
+        // Mesa drivers (Turnip, PanVK) only return core Vulkan 1.1 entry points for a 1.1
+        // instance. Android's loader calls vkGetPhysicalDeviceImageFormatProperties2 while
+        // creating the swap chain, so SDL's default 1.0 instance crashes there.
+        SDL_GPUVulkanOptions vulkan{};
+        vulkan.vulkan_api_version = (1u << 22) | (1u << 12); // VK_MAKE_API_VERSION(0, 1, 1, 0)
+        const SDL_PropertiesID create = SDL_CreateProperties();
+        SDL_SetBooleanProperty(create, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, (formats & SDL_GPU_SHADERFORMAT_SPIRV) != 0);
+        SDL_SetBooleanProperty(create, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);
+        SDL_SetStringProperty(create, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, driver);
+        SDL_SetPointerProperty(create, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER, &vulkan);
+        dev_ = SDL_CreateGPUDeviceWithProperties(create);
+        SDL_DestroyProperties(create);
+    } else
+#endif
     dev_ = SDL_CreateGPUDevice(formats, false, driver);
+#ifdef __ANDROID__
+    // A user-installed Vulkan driver may expose no usable device. Retry with the system driver
+    // and leave the reason where the launcher can show it.
+    if (!dev_ && SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
+        const std::string reason = SDL_GetError();
+        std::fprintf(stderr, "Custom Vulkan driver failed (%s); using the system driver\n", reason.c_str());
+        if (const char* state = SDL_GetHint("HOTD2_VULKAN_DRIVER_STATE"))
+            if (FILE* file = std::fopen(state, "w")) {
+                std::fprintf(file, "failed\n%s\n", reason.c_str());
+                std::fclose(file);
+            }
+        SDL_SetHint("HOTD2_VULKAN_DRIVER_STATE", nullptr);
+        SDL_ResetHint(SDL_HINT_VULKAN_LIBRARY);
+        dev_ = SDL_CreateGPUDevice(formats, false, driver);
+    }
+#endif
     if (!dev_) {
         if (error) *error = std::string("SDL_CreateGPUDevice: ") + SDL_GetError();
         return false;
+    }
+    if (!desc.offscreen) {
+        const SDL_PropertiesID props = SDL_GetGPUDeviceProperties(dev_);
+        char info[256];
+        std::snprintf(info, sizeof(info), "%s | %s %s", SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_NAME_STRING, "?"),
+                      SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_DRIVER_NAME_STRING, "?"),
+                      SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_DRIVER_VERSION_STRING, ""));
+        for (char& c : info) if (c == '\n' || c == '\r') c = ' ';
+        std::fprintf(stderr, "GPU: %s | %s\n", info, SDL_GetStringProperty(props, SDL_PROP_GPU_DEVICE_DRIVER_INFO_STRING, ""));
+#ifdef __ANDROID__
+        // The launcher shows the GPU and driver that the last game start used.
+        if (FILE* file = std::fopen("gpu-info.txt", "w")) {
+            std::fprintf(file, "%s\n", info);
+            std::fclose(file);
+        }
+#endif
     }
     if (window_) {
         if (!SDL_ClaimWindowForGPUDevice(dev_, window_)) {
@@ -482,10 +546,13 @@ bool SdlGpuDevice::CreateShaders(std::string* error) {
         {model_vs, sizeof(model_vs), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1, &modelVs_, "model vertex"},
         {prelit_vs, sizeof(prelit_vs), SDL_GPU_SHADERSTAGE_VERTEX, 0, 1, &naomiPrelitVs_, "prelit vertex"},
         {model_ps, sizeof(model_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 1, &modelPs_, "model fragment"},
+        {plain_model_ps, sizeof(plain_model_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, &plainModelPs_, "plain model fragment"},
+        {opaque_model_ps, sizeof(opaque_model_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, &opaqueModelPs_, "opaque model fragment"},
         {sprite_vs, sizeof(sprite_vs), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, &spriteVs_, "sprite vertex"},
         {sprite_ps, sizeof(sprite_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, &spritePs_, "sprite fragment"},
         {present_vs, sizeof(present_vs), SDL_GPU_SHADERSTAGE_VERTEX, 0, 0, &presentVs_, "present vertex"},
         {present_ps, sizeof(present_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, &presentPs_, "present fragment"},
+        {plain_present_ps, sizeof(plain_present_ps), SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1, &plainPresentPs_, "plain present fragment"},
     };
     for (const auto& shader : shaders) {
         SDL_GPUShaderCreateInfo info{};
@@ -522,6 +589,11 @@ bool SdlGpuDevice::CreatePresentPipeline(std::string* error) {
     pi.target_info.color_target_descriptions = &ct;
     pi.target_info.num_color_targets = 1;
     presentPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+#ifdef HOTD2_SDL_GPU_SPIRV
+    pi.fragment_shader = plainPresentPs_;
+    plainPresentPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+    pi.fragment_shader = presentPs_;
+#endif
     ct.format=SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     if(SDL_GPUTextureSupportsFormat(dev_,ct.format,SDL_GPU_TEXTURETYPE_2D,SDL_GPU_TEXTUREUSAGE_COLOR_TARGET))
         presentHdrPipe_=SDL_CreateGPUGraphicsPipeline(dev_,&pi);
@@ -1168,12 +1240,13 @@ void SdlGpuDevice::SetSpriteVertices(const game::TLVertex* v, size_t count) {
     spritePending_ = count > 0;
 }
 
-SDL_GPUGraphicsPipeline* SdlGpuDevice::Pipeline(GpuDraw::Pipeline kind, const GpuState& s, bool coverage) {
+SDL_GPUGraphicsPipeline* SdlGpuDevice::Pipeline(GpuDraw::Pipeline kind, const GpuState& s, bool coverage, ModelShader modelShader) {
     const bool sprite = kind == GpuDraw::Pipeline::Sprite;
     const bool prelit=kind==GpuDraw::Pipeline::NaomiPrelit;
     const uint32_t key = (sprite ? 1u : 0u) | (s.blendEnable ? 2u : 0u) | (s.blendEnable ? (s.srcBlend << 2) | (s.dstBlend << 6) : 0u) |
                          (static_cast<uint32_t>(s.zfunc) << 10) | (s.zwrite ? 1u << 14 : 0u) | (static_cast<uint32_t>(s.cull & 3) << 15) |
-                         (coverage ? 1u << 17 : 0u) | (hudReady_?1u<<18:0u) | (prelit?1u<<19:0u);
+                         (coverage ? 1u << 17 : 0u) | (hudReady_?1u<<18:0u) | (prelit?1u<<19:0u) |
+                         (static_cast<uint32_t>(modelShader) << 20);
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
 
@@ -1205,7 +1278,8 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::Pipeline(GpuDraw::Pipeline kind, const Gp
 
     SDL_GPUGraphicsPipelineCreateInfo pi = {};
     pi.vertex_shader = sprite ? spriteVs_ : prelit?naomiPrelitVs_:modelVs_;
-    pi.fragment_shader = sprite ? spritePs_ : modelPs_;
+    pi.fragment_shader = sprite ? spritePs_ : modelShader == ModelShader::Plain ? plainModelPs_
+                              : modelShader == ModelShader::NoAlphaTest ? opaqueModelPs_ : modelPs_;
     pi.vertex_input_state.vertex_buffer_descriptions = &vb;
     pi.vertex_input_state.num_vertex_buffers = 1;
     pi.vertex_input_state.vertex_attributes = attrs;
@@ -1346,17 +1420,37 @@ void SdlGpuDevice::Submit(const GpuDrawList& list) {
     SDL_SetGPUViewport(rp, &vp);
     SDL_GPUGraphicsPipeline* boundPipe = nullptr;
     SDL_GPUBuffer* boundVb = nullptr;
+    // Every sampler bind or uniform push makes SDL write a new descriptor set or uniform
+    // block. Consecutive draws of one model usually share them, so skip identical updates.
+    SDL_GPUTextureSamplerBinding boundSampler{};
+    SDL_GPUTextureSamplerBinding boundExtra[2]{};
+    bool extraBound = false;
+    // Models and sprites share fragment uniform slot 0; only a model push can be reused.
+    bool modelUniformsValid = false;
+    // The comparison copy lives on the heap; ModelConstants is over 1 KB.
+    if (!lastModelUniforms_) lastModelUniforms_ = std::make_unique<ModelConstants>();
+    ModelConstants& lastUniforms = *lastModelUniforms_;
+    auto resetBindings = [&] {
+        boundPipe = nullptr; boundVb = nullptr; boundSampler = {}; extraBound = false; modelUniformsValid = false;
+    };
     size_t drawIndex=0;
     for (const GpuDraw& d : list.draws) {
         if(drawIndex++==list.opaqueDrawCount&&list.opaqueDrawCount&&graphics_.ambientOcclusion) {
             SDL_EndGPURenderPass(rp);DrawAmbientOcclusion(list);ct.load_op=dt.load_op=SDL_GPU_LOADOP_LOAD;
-            rp=SDL_BeginGPURenderPass(cmd_,&ct,1,&dt);if(!rp)return;SDL_SetGPUViewport(rp,&vp);boundPipe=nullptr;boundVb=nullptr;
+            rp=SDL_BeginGPURenderPass(cmd_,&ct,1,&dt);if(!rp)return;SDL_SetGPUViewport(rp,&vp);resetBindings();
         }
         GpuState state = d.state;
         if (d.pipeline == GpuDraw::Pipeline::Model && graphics_.textureFilter) state.linear = graphics_.textureFilter == 2 ? 1 : 0;
         const bool coverage = d.pipeline == GpuDraw::Pipeline::Model && graphics_.alphaToCoverage && graphics_.msaa > 1 &&
             !state.blendEnable && list.model[d.constants].flags[2] >= 0;
-        SDL_GPUGraphicsPipeline* p = Pipeline(d.pipeline, state, coverage);
+        const bool pointMagnification = state.mipmapped && graphics_.anisotropy > 1 && !state.linear;
+        ModelShader modelShader = ModelShader::Full;
+        if (plainModelPs_ && d.pipeline == GpuDraw::Pipeline::Model && !pointMagnification) {
+            const auto& model = list.model[d.constants];
+            if (model.lightingOptions[0] <= 0.5f && model.depthEffects[0] <= 0)
+                modelShader = model.flags[2] < 0 ? ModelShader::NoAlphaTest : ModelShader::Plain;
+        }
+        SDL_GPUGraphicsPipeline* p = Pipeline(d.pipeline, state, coverage, modelShader);
         SDL_GPUBuffer* vb = d.stream == GpuDraw::Stream::Static ? staticVb_ : d.stream == GpuDraw::Stream::Dynamic ? dynVb_ : d.stream==GpuDraw::Stream::NaomiPrelit?naomiPrelitVb_:spriteVb_;
         if (!p || !vb) continue;
         if (p != boundPipe) {
@@ -1370,27 +1464,44 @@ void SdlGpuDevice::Submit(const GpuDrawList& list) {
         }
         SDL_GPUTexture* tex = d.texture && d.texture <= textures_.size() ? textures_[d.texture - 1] : white_;
         const SDL_GPUTextureSamplerBinding ts = { tex, Sampler(state) };
-        SDL_BindGPUFragmentSamplers(rp, 0, &ts, 1);
+        if (ts.texture != boundSampler.texture || ts.sampler != boundSampler.sampler) {
+            SDL_BindGPUFragmentSamplers(rp, 0, &ts, 1);
+            boundSampler = ts;
+        }
         if (d.pipeline != GpuDraw::Pipeline::Sprite) {
             ModelConstants c = list.model[d.constants];
             c.depthEffects[3]=opaqueReady_?1.0f:0.0f;
             const bool material=d.normalRoughnessTexture&&d.normalRoughnessTexture<=textures_.size();
             if(!material)c.materialParams[0]=0;
-            const SDL_GPUTextureSamplerBinding extra[]={{opaqueReady_?opaqueDepthColor_.texture:white_,postPointSampler_},{material?textures_[d.normalRoughnessTexture-1]:white_,Sampler(state)}};
-            SDL_BindGPUFragmentSamplers(rp,1,extra,2);
+            if (modelShader == ModelShader::Full) {
+                const SDL_GPUTextureSamplerBinding extra[] = {
+                    {opaqueReady_ ? opaqueDepthColor_.texture : white_, postPointSampler_},
+                    {material ? textures_[d.normalRoughnessTexture - 1] : white_, ts.sampler}
+                };
+                if (!extraBound || std::memcmp(extra, boundExtra, sizeof(extra)) != 0) {
+                    SDL_BindGPUFragmentSamplers(rp, 1, extra, 2);
+                    std::memcpy(boundExtra, extra, sizeof(extra));
+                    extraBound = true;
+                }
+            }
 #ifndef HOTD2_SDL_GPU_SPIRV
             const SDL_GPUTextureSamplerBinding shadow={shadowMapConstants_.parameters[3]>.5f?shadowMapColor_.texture:white_,postPointSampler_};
             SDL_BindGPUFragmentSamplers(rp,3,&shadow,1);
 #endif
-            c.sampling[0] = state.mipmapped && graphics_.anisotropy > 1 && !state.linear ? 1.0f : 0.0f;
+            c.sampling[0] = pointMagnification ? 1.0f : 0.0f;
             c.sampling[1] = static_cast<float>(state.addrU); c.sampling[2] = static_cast<float>(state.addrV);
-            SDL_PushGPUVertexUniformData(cmd_, 0, &c, sizeof(ModelConstants));
-            SDL_PushGPUFragmentUniformData(cmd_, 0, &c, sizeof(ModelConstants));
+            if (!modelUniformsValid || std::memcmp(&c, &lastUniforms, sizeof(ModelConstants)) != 0) {
+                SDL_PushGPUVertexUniformData(cmd_, 0, &c, sizeof(ModelConstants));
+                SDL_PushGPUFragmentUniformData(cmd_, 0, &c, sizeof(ModelConstants));
+                std::memcpy(&lastUniforms, &c, sizeof(ModelConstants));
+                modelUniformsValid = true;
+            }
 #ifndef HOTD2_SDL_GPU_SPIRV
             SDL_PushGPUFragmentUniformData(cmd_,1,&shadowMapConstants_,sizeof(ShadowConstants));
 #endif
         } else {
             SDL_PushGPUFragmentUniformData(cmd_, 0, &list.sprite[d.constants], sizeof(SpriteConstants));
+            modelUniformsValid = false;
         }
         SDL_DrawGPUPrimitives(rp, d.count, 1, d.first, 0);
     }
@@ -1508,6 +1619,11 @@ void SdlGpuDevice::EndFrame() {
     SDL_SubmitGPUCommandBuffer(cmd_);
     cmd_ = nullptr;
     acquiredSwap_ = nullptr;
+#ifdef __ANDROID__
+    // Once a custom driver has presented for a few seconds, the launcher no longer treats it as suspect.
+    if (window_ && ++presentedFrames_ == 180)
+        if (const char* state = SDL_GetHint("HOTD2_VULKAN_DRIVER_STATE")) std::remove(state);
+#endif
 }
 
 void SdlGpuDevice::DrawPresent(SDL_GPUTexture* target, int x, int y, int w, int h, int crt,bool hdr) {
@@ -1521,11 +1637,19 @@ void SdlGpuDevice::DrawPresent(SDL_GPUTexture* target, int x, int y, int w, int 
     if (SDL_GPURenderPass* rp = SDL_BeginGPURenderPass(cmd_, &ct, 1, nullptr)) {
         const SDL_GPUViewport vp = { static_cast<float>(x), static_cast<float>(y), static_cast<float>(w), static_cast<float>(h), 0, 1 };
         SDL_SetGPUViewport(rp, &vp);
-        SDL_BindGPUGraphicsPipeline(rp, hdr?presentHdrPipe_:presentPipe_);
         const SDL_GPUTextureSamplerBinding ts = { source, presentSampler_ };
-        SDL_BindGPUFragmentSamplers(rp, 0, &ts, 1);
         auto options=hudReady_?HudDisplayGraphics(graphics_):graphics_;if(fsr)options.sharpening=0;options.hdrOutput=hdr;
         const auto cb = MakePresentConstants(sourceWidth, sourceHeight, w, h, crt, options);
+        auto* pipeline = hdr ? presentHdrPipe_ : presentPipe_;
+#ifdef HOTD2_SDL_GPU_SPIRV
+        // Avoid running the desktop post-effect shader over every output pixel when its effects are off.
+        if (plainPresentPipe_ && !hdr && crt == 0 && options.postAA != 1 && !options.sharpening && !options.downsample &&
+            !options.bloom && !options.crtMask && !options.crtCurvature && !options.crtGlow && !options.colorGrade &&
+            options.brightness == 50 && options.gamma == 50 && options.contrast == 50 && options.saturation == 50)
+            pipeline = plainPresentPipe_;
+#endif
+        SDL_BindGPUGraphicsPipeline(rp, pipeline);
+        SDL_BindGPUFragmentSamplers(rp, 0, &ts, 1);
         SDL_PushGPUFragmentUniformData(cmd_, 0, &cb, sizeof(cb));
         SDL_DrawGPUPrimitives(rp, 3, 1, 0, 0);
         SDL_EndGPURenderPass(rp);

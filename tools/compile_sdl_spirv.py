@@ -10,10 +10,13 @@ SHADERS = (
     ("model_vs", "kModelShaderHlsl", "vert", "vsmain", ()),
     ("prelit_vs", "kModelShaderHlsl", "vert", "vsmain", ("NAOMI_PRELIT=1",)),
     ("model_ps", "kModelShaderHlsl", "frag", "psmain", ()),
+    ("plain_model_ps", "kModelShaderHlsl", "frag", "psmain", ("PLAIN_MODEL=1",)),
+    ("opaque_model_ps", "kModelShaderHlsl", "frag", "psmain", ("PLAIN_MODEL=1", "NO_ALPHA_TEST=1")),
     ("sprite_vs", "kSpriteShaderHlsl", "vert", "vsmain", ("SDLGPU_UBYTE4=1",)),
     ("sprite_ps", "kSpriteShaderHlsl", "frag", "psmain", ()),
     ("present_vs", "kPresentShaderHlsl", "vert", "vsmain", ()),
     ("present_ps", "kPresentShaderHlsl", "frag", "psmain", ()),
+    ("plain_present_ps", "kPresentShaderHlsl", "frag", "psmain", ("PLAIN_PRESENT=1",)),
 )
 
 FRAGMENT_BINDINGS = (
@@ -48,7 +51,7 @@ def compile_shaders(render_dir, output, glslc, validator):
         if stage == "frag":
             macros.extend(FRAGMENT_BINDINGS)
         arguments = [
-            glslc, "-x", "hlsl", "--target-env=vulkan1.0", "-fhlsl-iomap",
+            glslc, "-x", "hlsl", "--target-env=vulkan1.0", "-fhlsl-iomap", "-O",
             f"-fshader-stage={stage}", f"-fentry-point={entry}",
         ]
         if stage == "frag":

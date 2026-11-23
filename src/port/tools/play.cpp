@@ -841,6 +841,7 @@ int main(int argc, char** argv) {
     std::string naomiVisualsOverride;
     int graphicsModeOverride = -1;
     int viewportOverride = -1;
+    int internalHeight = 0;
     int p2mode = 6;  // --p2mode M: P2's device mode for --script (the hook's captures: 0, calibration path; world_test --p2mode)
     std::string scriptPath, screenshot, scenePath = "scenes/st1_play.scene", savePath = "hotd2re_save.bin";
     std::vector<std::pair<uint32_t, std::vector<uint8_t>>> savePatch;
@@ -884,6 +885,15 @@ int main(int argc, char** argv) {
             viewportOverride = static_cast<int>(format - formats.begin());
             ++i;
         }
+#ifdef __ANDROID__
+        else if (a == "--android-render-height") {
+            internalHeight = i + 1 < argc ? atoi(argv[++i]) : 0;
+            if (internalHeight != 360 && internalHeight != 480 && internalHeight != 960) {
+                std::fprintf(stderr, "--android-render-height requires 360, 480, or 960\n");
+                return 2;
+            }
+        }
+#endif
         else if (a == "--render-width" && i + 1 < argc) {
             captureRenderWidth = atoi(argv[++i]);
             captureRenderSizeGiven = true;
@@ -1053,6 +1063,10 @@ int main(int argc, char** argv) {
         volumes.display.viewport = viewportOverride;
         volumes.display.stretch = false;
     }
+    if (internalHeight) {
+        volumes.display.resolutionMode = static_cast<int>(port::OutputResolution::Original);
+        volumes.display.renderScale = internalHeight == 960 ? 2 : 1;
+    }
     // Menu style is a next-launch choice. Keep World, background textures and
     // port overlays on one theme for this entire process, including local restarts.
     const bool activeNightShift = volumes.display.nightShift;
@@ -1117,13 +1131,18 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::string naomiStartupNotice;
-    if (volumes.display.graphics.naomiGraphics && !assets.SetNaomiGraphics(true, &err)) {
+    if (!assets.SetNaomiGraphics(volumes.display.graphics.naomiGraphics, &err)) {
         naomiStartupNotice = "Naomi graphics data is missing or damaged. Restore the Naomi visual bank and try again. " + err;
+        if (internalHeight) {
+            naomiStartupNotice += " Using PC graphics.";
+            volumes.display.graphics.naomiGraphics = false;
+            assets.SetNaomiGraphics(false);
+        }
         std::fprintf(stderr, "%s\n", naomiStartupNotice.c_str());
 #ifdef PLAY_GUI
         if (screenshot.empty()) MessageBoxA(nullptr, naomiStartupNotice.c_str(), "HOTD2RE - Naomi graphics", MB_OK | MB_ICONERROR);
 #endif
-        return 1;
+        if (!internalHeight) return 1;
     }
     if (bloodOverrideGiven) volumes.display.EffectiveBloodColor() = bloodOverride;
     assets.SetBloodColor(volumes.display.EffectiveBloodColor());
@@ -1453,12 +1472,18 @@ int main(int argc, char** argv) {
     float viewportAspect = play::DisplayViewportAspect(volumes.display.viewport, initialWindowW, initialWindowH);
     const auto initialImage =
         play::DisplayImageRect(initialWindowW, initialWindowH, viewportAspect, volumes.display.stretch, volumes.display.integerScale);
-    const int authoredH = headless ? (captureRenderSizeGiven ? captureRenderHeight : height) : 480 * volumes.display.renderScale;
-    const int authoredW = headless ? (captureRenderSizeGiven ? captureRenderWidth : width)
-                                  : static_cast<int>(std::lround(authoredH * viewportAspect));
-    const auto initialSize = port::ChooseOutputResolution(static_cast<port::OutputResolution>(volumes.display.resolutionMode), authoredW,
-                                                          authoredH, initialImage.w, initialImage.h);
+    auto renderSize = [&](float aspect, int outputW, int outputH) {
+        const int authoredH = headless ? (captureRenderSizeGiven ? captureRenderHeight : height)
+                                       : (internalHeight == 360 && volumes.display.renderScale == 1 ? 360 : 480 * volumes.display.renderScale);
+        const int authoredW = headless ? (captureRenderSizeGiven ? captureRenderWidth : width)
+                                       : static_cast<int>(std::lround(authoredH * aspect));
+        return port::ChooseOutputResolution(static_cast<port::OutputResolution>(volumes.display.resolutionMode), authoredW,
+                                            authoredH, outputW, outputH);
+    };
+    const auto initialSize = renderSize(viewportAspect, initialImage.w, initialImage.h);
     const int renderH = initialSize.height, renderW = initialSize.width;
+    if (internalHeight) std::printf("Android render target: %dx%d, graphics: %s\n", renderW, renderH,
+                                    volumes.display.graphics.naomiGraphics ? "NAOMI" : "PC");
     std::string displayNotice;
     bool startupRendererFallback = false;
     auto gpu = play::CreateRequestedRenderer(
@@ -1643,9 +1668,7 @@ int main(int argc, char** argv) {
         int ww = width, wh = height;
         if (!headless) gpu->WindowSizePixels(&ww, &wh);
         const auto image = play::DisplayImageRect(ww, wh, aspect, volumes.display.stretch, volumes.display.integerScale);
-        const int ah = headless ? (captureRenderSizeGiven ? captureRenderHeight : height) : 480 * volumes.display.renderScale;
-        const int aw = headless ? (captureRenderSizeGiven ? captureRenderWidth : width) : static_cast<int>(std::lround(ah * aspect));
-        return port::ChooseOutputResolution(static_cast<port::OutputResolution>(volumes.display.resolutionMode), aw, ah, image.w, image.h);
+        return renderSize(aspect, image.w, image.h);
     };
 #ifdef _WIN32
     auto disableReconstruction = [&](int outputWidth, int outputHeight, const std::string& reason) {
@@ -4552,7 +4575,8 @@ int main(int argc, char** argv) {
 #endif
         if (!updatePrompt.IsOpen()) play::AppendMenuGameFade(world.Hud(),sprites);
         if (!headless) presentMapping();  // the window may have been resized / toggled; the settings may have changed
-        const bool outputResolutionMenu = !previewHidden &&
+        // Lower Android profiles composite menus at the same resolution as the scene.
+        const bool outputResolutionMenu = (internalHeight == 0 || internalHeight == 960) && !previewHidden &&
             (world.PortTypingActive() || menu.IsOpen() || optionsPage.IsOpen() || feedbackPage.IsOpen() || controllerPage.IsOpen() || lightgunPage.IsOpen() || wiiPage.IsOpen() || modelGallery.IsOpen() || usernamePrompt.IsOpen() || updatePrompt.IsOpen() ||
              world.Hud().nightShiftPage >= 0 || !world.Hud().menuText.empty() || world.GameMode() == 12 ||
              world.NetworkLobby() || lobby.page != Lobby::kOff);

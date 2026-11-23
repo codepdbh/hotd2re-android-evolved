@@ -51,3 +51,21 @@ La APK bilingüe compiló y pasó la verificación de firma. Se comprobaron los 
 En el S25, el lanzador cambió a inglés, conservó la selección al volver desde el juego y mostró en la vista previa el arranque del motor y los datos de Android.
 
 Para Android 1.0 pasaron la compilación y la tarea `lintVitalRelease`. Se verificaron el ABI ARM64, la versión mínima de Android 10, la firma v3 y la alineación de 16 KiB. El inventario de la APK confirmó las bibliotecas, las licencias y el descriptor de escena, sin archivos del juego de PC. Con una carpeta que contenía solo `Hod2.exe` y las siete carpetas de datos, el cliente de escritorio de HOTD2RE renderizó el fotograma 2300 de la primera fase.
+
+## Rendimiento en Redmi Note 8
+
+El 23 de noviembre de 2026, el Redmi Note 8 con Adreno 610 presentó entre 3 y 5 FPS con la APK anterior. En la compilación de prueba a 360p, la misma escena de combate bajo el menú de opciones presentó 10,4 FPS con gráficos NAOMI y 60 FPS al seleccionar PC. Las mediciones usan tiempos de presentación de SurfaceFlinger.
+
+La APK final firmada quedó instalada con **Ancho del teléfono**, **Original (480p)** y **PC (rendimiento)**. El motor confirmó un render interno de 1040 × 480. Las muestras de la primera fase dieron entre 54,4 y 60 FPS. En combate, las muestras de 60 fotogramas durante el disparo y la recarga dieron 60 FPS, con percentil 95 de 16,9 ms o menos. La recarga devolvió la munición de cinco a seis y los controles táctiles pausaron y reanudaron la partida. El lanzador conservó los ajustes al volver desde el juego.
+
+### Optimizaciones y drivers personalizados
+
+El 23 de noviembre de 2026 se midió la demo de la primera fase en el Redmi Note 8 (Adreno 610, Android 16) con **Ancho del teléfono** y **Original (480p)**, render interno de 1040 × 480:
+
+- Antes de las optimizaciones, en modo PC, simpleperf atribuía el 15 % del tiempo de CPU del hilo del juego a `memmove`, sobre todo por copias de constantes de modelo. El hilo del juego usaba alrededor del 68 % de un núcleo.
+- Después, en modo PC: 60 FPS, percentil 95 de 16,8 ms y alrededor del 27 % de un núcleo en el hilo del juego.
+- Después, en modo **Arcade (NAOMI)**: 60 FPS con percentil 95 de 16,9 ms, frente a 10,4 FPS a 360p antes de los cambios. El hilo del juego queda entre el 60 % y el 78 % de un núcleo. Las mediciones anteriores no usaron exactamente la misma escena.
+- Driver del sistema: `Adreno (TM) 610 | Qualcomm Technologies Inc. Adreno Vulkan Driver 512.502.0`.
+- `Turnip_v26.0.0_R8.zip` (K11MCH1/AdrenoToolsDrivers) se instaló desde el lanzador y el motor informó `Turnip Adreno (TM) 610 | turnip Mesa driver 25.99.99`. Con una instancia Vulkan 1.0, el loader de Android falló con SIGSEGV al crear la swap chain. Con la instancia 1.1 el juego arrancó, pero dio 33 FPS en NAOMI y mostró franjas en algunas superficies. En este modelo conviene el driver del sistema.
+- Tras el fallo con Turnip, el lanzador mostró **Driver de GPU desactivado** y volvió a seleccionar el driver del sistema.
+- No se probaron drivers en GPU Mali o PowerVR por falta de hardware.

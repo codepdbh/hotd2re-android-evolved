@@ -263,6 +263,7 @@ bool AssetStore::Open(const std::filesystem::path& gameDir, std::string* error) 
         auto& list = byFile_[f.name];
         for (int i = 0; i < f.count; ++i) list.push_back({ f.index, f.name, game::ReadTextureDesc(exe_, f, i), i });
     }
+    texRefById_.clear();
     redBloodTextures_.clear();
     if (auto it = byFile_.find("scr_blood_red.bin"); it != byFile_.end())
         for (const auto& r : it->second) redBloodTextures_.emplace(r.desc.id, r);
@@ -528,15 +529,24 @@ const RgbaImage* AssetStore::NormalRoughness(const std::string& polName, uint32_
 }
 
 const RgbaImage* AssetStore::TextureById(int fileIndex, uint32_t id) {
-    for (const auto& [name, list] : byFile_) {
-        if (list.empty() || list[0].fileIndex != fileIndex) continue;
-        for (size_t i = 0; i < list.size(); ++i) {
-            if (list[i].desc.id != id) continue;
-            return ResolvedTexture(list[i]);
+    // Scene sprites look textures up by id every frame; scanning every texture file was a
+    // top CPU cost on phones. Cache the descriptor (or its absence) per (file, id).
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(fileIndex)) << 32) | id;
+    auto cached = texRefById_.find(key);
+    if (cached == texRefById_.end()) {
+        const TexRef* found = nullptr;
+        for (const auto& [name, list] : byFile_) {
+            if (list.empty() || list[0].fileIndex != fileIndex) continue;
+            for (const TexRef& ref : list)
+                if (ref.desc.id == id) {
+                    found = &ref;
+                    break;
+                }
+            break;
         }
-        return nullptr;
+        cached = texRefById_.emplace(key, found).first;
     }
-    return nullptr;
+    return cached->second ? ResolvedTexture(*cached->second) : nullptr;
 }
 
 const RgbaImage* AssetStore::ResolvedTexture(const TexRef& original) {
@@ -787,6 +797,7 @@ std::unique_ptr<RgbaImage> AssetStore::Decode(const TexRef& r) {
 bool AssetStore::LoadTypingReference(const std::string& path, std::string* error) {
     auto reference = std::make_unique<game::TypingReference>();
     if (!reference->Load(path, error)) return false;
+    texRefById_.clear();  // the descriptor lists below are replaced
     for (const auto& resource : reference->Resources()) {
         if (resource.kind != 1) continue;
         auto& descriptors = byFile_[resource.name];

@@ -40,6 +40,23 @@ La APK aporta la biblioteca ARM64 de HOTD2RE, SDL3, el descriptor de escena del 
 - `compile_sdl_spirv.py` compila siete etapas a partir de los shaders HLSL que ya usa SDL_GPU. La ruta Vulkan conserva los modelos, sprites y presentación. Las capacidades avanzadas que usan otros shaders, como TAA, SMAA, CMAA2 y mapas de sombras, quedan deshabilitadas en ese perfil inicial.
 - Se reutiliza `TouchGuns` para disparo y recarga. Se cancelan los contactos al perder foco y el botón Atrás se entrega al motor como Escape. La fase de pruebas en Android debe comprobar los gestos y la pausa con el juego abierto.
 
+## Drivers de GPU personalizados
+
+**Configuración → Driver de GPU (Vulkan) → Instalar driver…** acepta un paquete `.zip` con `meta.json` (el formato de adrenotools que usan Turnip y otros builds de Mesa) o un archivo `.so` ARM64. El lanzador copia el driver a `files/vulkan_drivers/` y lo pasa al motor al pulsar **Jugar**.
+
+- `android_entry.cpp` abre con libadrenotools una instancia separada de `libvulkan.so`. Su hook sustituye cualquier HAL `vulkan.*.so` del fabricante, por lo que sirve en Adreno (Turnip), Mali (PanVK) y GPU PowerVR o Mali de MediaTek, siempre que el driver implemente `VK_ANDROID_native_buffer`.
+- SDL carga `libhotd2_vulkan_shim.so` mediante `SDL_HINT_VULKAN_LIBRARY`. La shim reenvía `vkGetInstanceProcAddr` a esa instancia.
+- Con un driver personalizado, SDL crea una instancia Vulkan 1.1. Mesa no devuelve `vkGetPhysicalDeviceImageFormatProperties2` en una instancia 1.0, y el loader de Android la usa al crear la swap chain.
+- Si el driver no carga o no ofrece un dispositivo, el motor vuelve al driver del sistema. Si el juego se cierra antes de presentar 180 fotogramas, `vulkan-driver.state` queda en disco y el lanzador vuelve a seleccionar el driver del sistema y lo avisa.
+- `gpu-info.txt` guarda la GPU y el driver del último inicio, y el lanzador los muestra.
+
+## Rendimiento
+
+- `SdlGpuDevice::Submit` evita volver a enlazar texturas y volver a subir las constantes de modelo (más de 1 KB) cuando un draw repite las del anterior. Cada cambio obligaba a SDL a escribir un descriptor set o un bloque de uniforms nuevo.
+- `ModelRenderer` reserva la lista de draws con el tamaño del fotograma anterior para no copiar las constantes al crecer los vectores.
+- `AssetStore::TextureById` guarda en caché la búsqueda por archivo e id, que recorría todas las texturas en cada sprite de cada fotograma.
+- El manifiesto declara la app como juego (`appCategory="game"` y `game_mode_config`) y `profileable` para medir con simpleperf.
+
 ## Reproducir la captura Vulkan de escritorio
 
 Configurar el checkout con MSVC Win32 y activar `HOTD2_SDL_GPU_SPIRV=ON`. Indicar las rutas de `glslc.exe` y `spirv-val.exe` del NDK mediante `HOTD2_GLSLC` y `HOTD2_SPIRV_VAL`. Compilar `play` en Release. Desde el checkout, usar el backend SDL_GPU y el modo captura para renderizar sin ventana.

@@ -50,6 +50,28 @@ if (!(Test-Path -LiteralPath $marker) -or (Get-Content -LiteralPath $marker -Raw
     Set-Content -LiteralPath $marker -Value $sha256 -Encoding ASCII
 }
 
+# libadrenotools (custom Vulkan drivers) and its linker namespace helper, pinned like SDL.
+foreach ($dep in @(
+        @{ Name = 'libadrenotools'; Commit = '8fae8ce254dfc1344527e05301e43f37dea2df80';
+           Sha = 'ceffce971676d4cfdf348a082df06fc92a1dca6d95bea892a480d63f200961cb' },
+        @{ Name = 'liblinkernsbypass'; Commit = 'aa3975893d83ef1bc84c321ec60c65fbf1287887';
+           Sha = 'da1128c8aa771c4d24766b53a47822d0717baa5c536ca8491220402942b80638' })) {
+    $depArchive = Join-Path $deps.FullName "$($dep.Name)-$($dep.Commit).tar.gz"
+    if (!(Test-Path -LiteralPath $depArchive) -or (Get-FileHash -LiteralPath $depArchive).Hash -ne $dep.Sha) {
+        if ($Offline) { throw "The verified $($dep.Name) archive is required in .work/deps in offline mode." }
+        & curl.exe --fail --location --silent --show-error --output $depArchive "https://github.com/bylaws/$($dep.Name)/archive/$($dep.Commit).tar.gz"
+        if ($LASTEXITCODE -ne 0) { throw "$($dep.Name) download failed." }
+    }
+    if ((Get-FileHash -LiteralPath $depArchive).Hash -ne $dep.Sha) { throw "Unexpected $($dep.Name) archive SHA-256." }
+    $depSource = Join-Path $deps.FullName "$($dep.Name)-$($dep.Commit)"
+    $depMarker = Join-Path $depSource '.archive-sha256'
+    if (!(Test-Path -LiteralPath $depMarker) -or (Get-Content -LiteralPath $depMarker -Raw).Trim() -ne $dep.Sha) {
+        & tar.exe -xf $depArchive -C $deps.FullName
+        if ($LASTEXITCODE -ne 0) { throw "$($dep.Name) extraction failed." }
+        Set-Content -LiteralPath $depMarker -Value $dep.Sha -Encoding ASCII
+    }
+}
+
 $savedSdk = $env:ANDROID_HOME
 $savedLegacySdk = $env:ANDROID_SDK_ROOT
 $savedJdk = $env:JAVA_HOME

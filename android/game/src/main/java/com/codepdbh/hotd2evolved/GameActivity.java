@@ -25,8 +25,12 @@ import java.util.List;
 
 public final class GameActivity extends SDLActivity {
     static final String EXTRA_VIEWPORT = "viewport";
+    static final String EXTRA_RENDER_HEIGHT = "render_height";
+    static final String EXTRA_GRAPHICS_MODE = "graphics_mode";
     static final String EXTRA_AUDIO = "audio";
     static final String EXTRA_ONLINE = "online";
+    static final String EXTRA_DRIVER_DIRECTORY = "vulkan_driver_directory";
+    static final String EXTRA_DRIVER_LIBRARY = "vulkan_driver_library";
 
     // Shared with android_controls.h.
     private static final int CONTROL_CONTINUE = 1;
@@ -165,9 +169,22 @@ public final class GameActivity extends SDLActivity {
         String format = getIntent().getStringExtra(EXTRA_VIEWPORT);
         if (format == null) format = "4:3";
         List<String> args = new ArrayList<>(Arrays.asList("game", "--renderer", "sdlgpu", "--input", "touch",
-                "--no-update-check", "--viewport", format));
+                "--no-update-check", "--viewport", format, "--android-render-height",
+                Integer.toString(getIntent().getIntExtra(EXTRA_RENDER_HEIGHT, 480))));
+        String graphicsMode = getIntent().getStringExtra(EXTRA_GRAPHICS_MODE);
+        if ("pc".equals(graphicsMode) || "naomi".equals(graphicsMode)) {
+            args.add("--graphics-mode");
+            args.add(graphicsMode);
+        }
         if (getIntent().getBooleanExtra(EXTRA_AUDIO, true)) args.add("--audio");
         if (getIntent().getBooleanExtra(EXTRA_ONLINE, false)) args.add("--online");
+        String driverDirectory = getIntent().getStringExtra(EXTRA_DRIVER_DIRECTORY);
+        String driverLibrary = getIntent().getStringExtra(EXTRA_DRIVER_LIBRARY);
+        if (driverDirectory != null && driverLibrary != null) {
+            // Consumed by android_entry.cpp before the engine parses its arguments.
+            args.addAll(Arrays.asList("--vulkan-driver-dir", driverDirectory, "--vulkan-driver-lib", driverLibrary,
+                    "--native-lib-dir", getApplicationInfo().nativeLibraryDir));
+        }
         return args.toArray(new String[0]);
     }
 

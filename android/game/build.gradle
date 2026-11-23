@@ -7,6 +7,14 @@ if (!new File(source, 'src/port/tools/play.cpp').isFile()) {
     source = rootProject.file('../upstream/hotd2-re')
 }
 def sdl = rootProject.file('../.work/deps/SDL3-3.4.18')
+// Pre-downloaded by scripts/build_android.ps1; otherwise CMake fetches the pinned archives.
+def adrenotools = rootProject.file('../.work/deps/libadrenotools-8fae8ce254dfc1344527e05301e43f37dea2df80')
+def linkernsbypass = rootProject.file('../.work/deps/liblinkernsbypass-aa3975893d83ef1bc84c321ec60c65fbf1287887')
+def nativeArguments = ["-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdl.absolutePath}", '-DANDROID_STL=c++_static']
+if (new File(adrenotools, 'src/driver.cpp').isFile() && new File(linkernsbypass, 'android_linker_ns.cpp').isFile()) {
+    nativeArguments += ["-DFETCHCONTENT_SOURCE_DIR_ADRENOTOOLS=${adrenotools.absolutePath}",
+                        "-DFETCHCONTENT_SOURCE_DIR_LINKERNSBYPASS=${linkernsbypass.absolutePath}"]
+}
 def portAssets = layout.buildDirectory.dir('generated/portAssets')
 def preparePortAssets = tasks.register('preparePortAssets', Copy) {
     into(portAssets)
@@ -44,8 +52,9 @@ android {
         }
         externalNativeBuild {
             cmake {
-                arguments "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdl.absolutePath}", '-DANDROID_STL=c++_static'
-                targets 'hotd2_android', 'SDL3-shared'
+                arguments(*nativeArguments)
+                // main_hook and hook_impl load custom Vulkan drivers; the shim hands them to SDL.
+                targets 'hotd2_android', 'SDL3-shared', 'main_hook', 'hook_impl', 'hotd2_vulkan_shim'
             }
         }
     }
@@ -65,6 +74,13 @@ android {
                     arguments '-DCMAKE_BUILD_TYPE=Release'
                 }
             }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // libadrenotools loads its hooks from nativeLibraryDir, so the libraries must be extracted.
+            useLegacyPackaging true
         }
     }
 

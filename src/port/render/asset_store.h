@@ -9,6 +9,7 @@
 #include <deque>
 #include <filesystem>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -176,6 +177,7 @@ private:
     const RgbaImage* ResolvedTexture(const TexRef& r);
     const RgbaImage* NaomiTexture(const std::string& bank,uint32_t index,int logicalWidth=0,int logicalHeight=0);
     std::map<uint32_t, TexRef> redBloodTextures_;
+    std::unordered_map<uint64_t, const TexRef*> texRefById_;  // TextureById: (file index, id) -> descriptor in byFile_
     std::map<std::pair<BloodColor, uint32_t>, std::unique_ptr<RgbaImage>> recoloredBloodTextures_;
     BloodColor bloodColor_ = BloodColor::Green;
     // Asset pack: <HOTD2_ASSET_DIR>/tex/<file stem>/<index>.png (any size, upright) -> flipped to the stored order.

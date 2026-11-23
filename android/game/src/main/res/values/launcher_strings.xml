@@ -4,6 +4,18 @@
     <string name="launcher_settings">Configuración</string>
     <string name="launcher_language">Idioma del lanzador</string>
     <string name="launcher_format">Formato de pantalla</string>
+    <string name="launcher_resolution">Resolución interna</string>
+    <string name="launcher_graphics_mode">Modo gráfico</string>
+    <string-array name="launcher_graphics_modes">
+        <item>Ajuste del juego</item>
+        <item>PC (rendimiento)</item>
+        <item>Arcade (NAOMI)</item>
+    </string-array>
+    <string-array name="launcher_resolutions">
+        <item>Ligera (360p)</item>
+        <item>Original (480p)</item>
+        <item>Alta (960p)</item>
+    </string-array>
     <string-array name="launcher_formats">
         <item>Clásico (4:3)</item>
         <item>Panorámico (16:9)</item>
@@ -43,4 +55,20 @@
     <string name="report_no_browser">No hay un navegador disponible. Puedes copiar el informe.</string>
     <string name="report_issue_title">Error en Android Evolved</string>
     <string name="report_issue_intro">### Qué pasó\n\nDescribe el error y los pasos para reproducirlo.</string>
+    <string name="driver_label">Driver de GPU (Vulkan)</string>
+    <string name="driver_system">Sistema (driver del fabricante)</string>
+    <string name="driver_install">Instalar driver…</string>
+    <string name="driver_remove">Eliminar</string>
+    <string name="driver_remove_confirm">¿Eliminar el driver %1$s?</string>
+    <string name="driver_installing">Instalando el driver…</string>
+    <string name="driver_installed">Driver instalado: %1$s</string>
+    <string name="driver_help">Acepta paquetes .zip con meta.json (formato adrenotools) o un archivo .so ARM64: Turnip para Adreno, PanVK para Mali y otros drivers Mesa para PowerVR o MediaTek. Si el driver falla, el juego vuelve al del sistema.</string>
+    <string name="driver_gpu">Último inicio: %1$s</string>
+    <string name="driver_gpu_unknown">La GPU y el driver en uso se mostrarán tras iniciar el juego.</string>
+    <string name="driver_unreadable">No se pudo leer el archivo del driver.</string>
+    <string name="driver_invalid_package">El archivo no es un paquete de driver válido. Usa un .zip con meta.json y la librería, o un archivo .so.</string>
+    <string name="driver_wrong_arch">El driver debe ser una librería ARM64 (arm64-v8a).</string>
+    <string name="driver_failed_title">Driver de GPU desactivado</string>
+    <string name="driver_failed">El driver personalizado no funcionó en este teléfono y el juego usó el driver del sistema. Se volvió a seleccionar el driver del sistema.</string>
+    <string name="driver_crashed">El juego se cerró mientras iniciaba con el driver personalizado. Se volvió a seleccionar el driver del sistema.</string>
 </resources>

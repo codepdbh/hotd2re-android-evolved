@@ -32,6 +32,8 @@ Copia completas las carpetas indicadas. Si tu instalación contiene `Hod2.ini`, 
 
 Para jugar entre dos teléfonos, instala la misma versión en ambos. En el primero abre **Online → Peer to Peer → Host** y deja abierta la sala. En el segundo abre **Online → Peer to Peer → Join** y toca los cinco números del código en el teclado del juego. La conexión empieza al tocar el quinto dígito.
 
+En **Configuración → Driver de GPU (Vulkan)** puedes instalar un driver personalizado (.zip de adrenotools o .so ARM64), como Turnip para Adreno o PanVK para Mali. Si falla, el juego vuelve al driver del sistema.
+
 Si ocurre un error, **Configuración → Enviar registros a GitHub** muestra el diagnóstico y abre un borrador de incidencia. Puedes revisarlo y enviarlo desde GitHub.
 
 ## English
@@ -63,6 +65,8 @@ Copy each listed folder in full. If your installation has `Hod2.ini`, put it bes
 3. Once the launcher says **Ready to play**, choose your launcher language and display format in **Settings**. Tap **Play** to start the game or **Online** to open the lobby.
 
 To play on two phones, install the same release on both. On the first phone, open **Online → Peer to Peer → Host** and keep the room open. On the second phone, open **Online → Peer to Peer → Join** and tap the five digits on the in-game keypad. The connection starts after the fifth digit.
+
+In **Settings → GPU driver (Vulkan)** you can install a custom driver (adrenotools .zip or ARM64 .so), such as Turnip for Adreno or PanVK for Mali. If it fails, the game returns to the system driver.
 
 If you run into a problem, **Settings → Send logs to GitHub** shows the diagnostics and opens a draft issue. You can review and submit it on GitHub.
 
