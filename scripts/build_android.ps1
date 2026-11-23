@@ -5,7 +5,9 @@ param(
     [switch]$Offline,
     [switch]$WithTests,
     [switch]$Game,
-    [switch]$Release
+    [switch]$Release,
+    # armeabi-v7a builds the experimental 32-bit APK (no custom Vulkan drivers).
+    [ValidateSet('arm64-v8a', 'armeabi-v7a')][string]$Abi = 'arm64-v8a'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -82,6 +84,7 @@ try {
     $module = if ($Game) { 'game' } else { 'app' }
     $variant = if ($Release) { 'Release' } else { 'Debug' }
     $gradleArgs = @('-p', (Join-Path $root 'android'), '--no-daemon', '--console=plain', ":${module}:assemble${variant}")
+    if ($Game) { $gradleArgs += "-Photd2Abi=$Abi" }
     if ($WithTests) { $gradleArgs += ':app:assembleDebugAndroidTest' }
     if ($Offline) { $gradleArgs += '--offline' }
     # Windows PowerShell turns redirected native stderr into error records.

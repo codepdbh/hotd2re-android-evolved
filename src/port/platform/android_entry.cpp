@@ -2,7 +2,9 @@
 #include <SDL3/SDL_main.h>
 #include <SDL3/SDL_system.h>
 
+#ifdef HOTD2_CUSTOM_VULKAN_DRIVERS
 #include <adrenotools/driver.h>
+#endif
 #include <android/log.h>
 #include <atomic>
 #include <cstdio>
@@ -95,6 +97,11 @@ void UseCustomVulkanDriver(const VulkanDriverRequest& request) {
         WriteVulkanDriverState("failed", "missing " + request.library);
         return;
     }
+#ifndef HOTD2_CUSTOM_VULKAN_DRIVERS
+    fprintf(stderr, "Custom Vulkan drivers need the 64-bit build; using the system driver\n");
+    WriteVulkanDriverState("failed", "64-bit only");
+    return;
+#else
     WriteVulkanDriverState("loading", request.library);
     void* loader = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, nullptr, request.hooks.c_str(),
                                               request.directory.c_str(), request.library.c_str(), nullptr, nullptr);
@@ -113,6 +120,7 @@ void UseCustomVulkanDriver(const VulkanDriverRequest& request) {
     SDL_SetHint(SDL_HINT_VULKAN_LIBRARY, shimPath.c_str());
     SDL_SetHint("HOTD2_VULKAN_DRIVER_STATE", kVulkanDriverState);
     fprintf(stderr, "Custom Vulkan driver: %s\n", name.c_str());
+#endif
 }
 
 } // namespace

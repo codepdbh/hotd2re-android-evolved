@@ -222,7 +222,7 @@ if(HOTD2_SDL3)
   target_link_libraries(scene_viewer PRIVATE port_platform)
 
   # play.exe - playable game on the native world (game mode 6): gun input, gameplay HUD, sound.
-  if(ANDROID)
+  if(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     # Custom Vulkan drivers (Turnip, PanVK, other Mesa builds). libadrenotools hooks the
     # system loader's "vulkan.*.so" HAL load, so it is not limited to Adreno GPUs.
     include(FetchContent)
@@ -259,7 +259,13 @@ if(HOTD2_SDL3)
     add_library(hotd2_android SHARED tools/play.cpp platform/android_entry.cpp)
     set_target_properties(hotd2_android PROPERTIES OUTPUT_NAME main)
     target_link_libraries(hotd2_android PRIVATE port_platform game_hud port_play port_net port_update hotd2_adrenotools log)
+    target_compile_definitions(hotd2_android PRIVATE HOTD2_CUSTOM_VULKAN_DRIVERS)
     add_dependencies(hotd2_android main_hook hook_impl hotd2_vulkan_shim)
+  elseif(ANDROID)
+    # 32-bit ARM: libadrenotools and its linker bypass support only arm64-v8a.
+    add_library(hotd2_android SHARED tools/play.cpp platform/android_entry.cpp)
+    set_target_properties(hotd2_android PROPERTIES OUTPUT_NAME main)
+    target_link_libraries(hotd2_android PRIVATE port_platform game_hud port_play port_net port_update log)
   else()
     add_executable(play tools/play.cpp)
     target_link_libraries(play PRIVATE port_platform game_hud port_play port_net port_update)

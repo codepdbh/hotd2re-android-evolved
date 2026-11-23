@@ -10,6 +10,9 @@ def sdl = rootProject.file('../.work/deps/SDL3-3.4.18')
 // Pre-downloaded by scripts/build_android.ps1; otherwise CMake fetches the pinned archives.
 def adrenotools = rootProject.file('../.work/deps/libadrenotools-8fae8ce254dfc1344527e05301e43f37dea2df80')
 def linkernsbypass = rootProject.file('../.work/deps/liblinkernsbypass-aa3975893d83ef1bc84c321ec60c65fbf1287887')
+// -Photd2Abi=armeabi-v7a builds the experimental 32-bit APK; custom Vulkan drivers are 64-bit only.
+def abi = providers.gradleProperty('hotd2Abi').getOrElse('arm64-v8a')
+def customDrivers = abi == 'arm64-v8a'
 def nativeArguments = ["-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdl.absolutePath}", '-DANDROID_STL=c++_static']
 if (new File(adrenotools, 'src/driver.cpp').isFile() && new File(linkernsbypass, 'android_linker_ns.cpp').isFile()) {
     nativeArguments += ["-DFETCHCONTENT_SOURCE_DIR_ADRENOTOOLS=${adrenotools.absolutePath}",
@@ -48,13 +51,17 @@ android {
         versionName '1.1'
 
         ndk {
-            abiFilters 'arm64-v8a'
+            abiFilters abi
         }
         externalNativeBuild {
             cmake {
                 arguments(*nativeArguments)
                 // main_hook and hook_impl load custom Vulkan drivers; the shim hands them to SDL.
-                targets 'hotd2_android', 'SDL3-shared', 'main_hook', 'hook_impl', 'hotd2_vulkan_shim'
+                if (customDrivers) {
+                    targets 'hotd2_android', 'SDL3-shared', 'main_hook', 'hook_impl', 'hotd2_vulkan_shim'
+                } else {
+                    targets 'hotd2_android', 'SDL3-shared'
+                }
             }
         }
     }

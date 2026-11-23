@@ -179,7 +179,14 @@ public final class DataActivity extends Activity {
         renderResolution = addSavedSelector(options, R.string.launcher_resolution, R.array.launcher_resolutions, RESOLUTION_SETTING, 1);
         graphicsMode = addSavedSelector(options, R.string.launcher_graphics_mode, R.array.launcher_graphics_modes, GRAPHICS_MODE_SETTING, 0);
 
-        driver = addSelector(options, R.string.driver_label, new String[0]);
+        // The 32-bit build ships without the driver hooks.
+        boolean driversSupported = new java.io.File(getApplicationInfo().nativeLibraryDir, "libmain_hook.so").isFile();
+        LinearLayout driverSection = new LinearLayout(this);
+        driverSection.setOrientation(LinearLayout.VERTICAL);
+        driverSection.setVisibility(driversSupported ? View.VISIBLE : View.GONE);
+        options.addView(driverSection, new LinearLayout.LayoutParams(-1, -2));
+        if (!driversSupported) settings.edit().putString(DRIVER_SETTING, VulkanDrivers.SYSTEM).apply();
+        driver = addSelector(driverSection, R.string.driver_label, new String[0]);
         driver.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -202,11 +209,11 @@ public final class DataActivity extends Activity {
         LinearLayout.LayoutParams removeParams = new LinearLayout.LayoutParams(0, dp(48), 1);
         removeParams.setMarginStart(dp(8));
         driverActions.addView(removeDriver, removeParams);
-        addRow(options, driverActions, 6);
+        addRow(driverSection, driverActions, 6);
         gpuInfo = text("", 12, MUTED);
         addRow(options, gpuInfo, 6);
         TextView driverHelp = text(getString(R.string.driver_help), 12, MUTED);
-        addRow(options, driverHelp, 4);
+        addRow(driverSection, driverHelp, 4);
         refreshDrivers();
 
         View divider = new View(this);
