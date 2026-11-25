@@ -60,6 +60,34 @@ SDL_GPUSamplerAddressMode ToAddress(int d3d7) {
                                                                       : SDL_GPU_SAMPLERADDRESSMODE_REPEAT;
 }
 
+#ifdef __ANDROID__
+SDL_GPUDevice* CreateAndroidVulkanDevice(const char* driver, bool custom, bool anisotropy) {
+    const SDL_PropertiesID props = SDL_CreateProperties();
+    if (!props) return nullptr;
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, true);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);
+    SDL_SetStringProperty(props, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, driver);
+    // The Android shaders use fixed-function clipping and only direct draws.
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_CLIP_DISTANCE_BOOLEAN, false);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_DEPTH_CLAMPING_BOOLEAN, false);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_INDIRECT_DRAW_FIRST_INSTANCE_BOOLEAN, false);
+    SDL_SetBooleanProperty(props, SDL_PROP_GPU_DEVICE_CREATE_FEATURE_ANISOTROPY_BOOLEAN, anisotropy);
+    SDL_GPUVulkanOptions vulkan{};
+    if (custom) {
+        // Android's loader uses core 1.1 entry points with custom Mesa drivers.
+        vulkan.vulkan_api_version = (1u << 22) | (1u << 12);
+        SDL_SetPointerProperty(props, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER, &vulkan);
+    }
+    auto* device = SDL_CreateGPUDeviceWithProperties(props);
+    SDL_DestroyProperties(props);
+    return device;
+}
+
+void LogVulkanStartupFailure(const char* stage) {
+    std::fprintf(stderr, "Vulkan startup failed: %s\n", stage);
+}
+#endif
+
 class SdlGpuDevice final : public GpuDevice {
 public:
     ~SdlGpuDevice() override;
@@ -105,6 +133,7 @@ private:
     bool CreatePresentPipeline(std::string* error);
     bool CreatePostPipelines(std::string* error);
     bool CreateTargets(int w, int h, int samples = 0);
+    SDL_GPUTextureFormat depthFormat_ = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     SDL_GPUPresentMode SelectPresentMode(const GraphicsOptions&) const;
     void DrawPresent(SDL_GPUTexture* target, int x, int y, int w, int h, int crt,bool hdr=false);
     void UpdateHdrCapabilities() const;
@@ -340,42 +369,34 @@ bool SdlGpuDevice::Init(const GpuDeviceDesc& desc, std::string* error) {
         return false;
     }
 #ifdef __ANDROID__
-    if (SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
-        // Mesa drivers (Turnip, PanVK) only return core Vulkan 1.1 entry points for a 1.1
-        // instance. Android's loader calls vkGetPhysicalDeviceImageFormatProperties2 while
-        // creating the swap chain, so SDL's default 1.0 instance crashes there.
-        SDL_GPUVulkanOptions vulkan{};
-        vulkan.vulkan_api_version = (1u << 22) | (1u << 12); // VK_MAKE_API_VERSION(0, 1, 1, 0)
-        const SDL_PropertiesID create = SDL_CreateProperties();
-        SDL_SetBooleanProperty(create, SDL_PROP_GPU_DEVICE_CREATE_SHADERS_SPIRV_BOOLEAN, (formats & SDL_GPU_SHADERFORMAT_SPIRV) != 0);
-        SDL_SetBooleanProperty(create, SDL_PROP_GPU_DEVICE_CREATE_DEBUGMODE_BOOLEAN, false);
-        SDL_SetStringProperty(create, SDL_PROP_GPU_DEVICE_CREATE_NAME_STRING, driver);
-        SDL_SetPointerProperty(create, SDL_PROP_GPU_DEVICE_CREATE_VULKAN_OPTIONS_POINTER, &vulkan);
-        dev_ = SDL_CreateGPUDeviceWithProperties(create);
-        SDL_DestroyProperties(create);
-    } else
-#endif
-    dev_ = SDL_CreateGPUDevice(formats, false, driver);
-#ifdef __ANDROID__
-    // A user-installed Vulkan driver may expose no usable device. Retry with the system driver
-    // and leave the reason where the launcher can show it.
-    if (!dev_ && SDL_GetHint(SDL_HINT_VULKAN_LIBRARY)) {
-        const std::string reason = SDL_GetError();
-        std::fprintf(stderr, "Custom Vulkan driver failed (%s); using the system driver\n", reason.c_str());
-        if (const char* state = SDL_GetHint("HOTD2_VULKAN_DRIVER_STATE"))
-            if (FILE* file = std::fopen(state, "w")) {
-                std::fprintf(file, "failed\n%s\n", reason.c_str());
-                std::fclose(file);
-            }
-        SDL_SetHint("HOTD2_VULKAN_DRIVER_STATE", nullptr);
-        SDL_ResetHint(SDL_HINT_VULKAN_LIBRARY);
-        dev_ = SDL_CreateGPUDevice(formats, false, driver);
+    const bool custom = SDL_GetHint("HOTD2_VULKAN_DRIVER_STATE") != nullptr;
+    dev_ = CreateAndroidVulkanDevice(driver, custom, true);
+    if (dev_) {
+        capabilities_.maxAnisotropy = 16;
+    } else {
+        std::fprintf(stderr, "Vulkan retry: anisotropic filtering disabled\n");
+        dev_ = CreateAndroidVulkanDevice(driver, custom, false);
     }
+#else
+    dev_ = SDL_CreateGPUDevice(formats, false, driver);
+    capabilities_.maxAnisotropy = 16;
 #endif
     if (!dev_) {
+#ifdef __ANDROID__
+        LogVulkanStartupFailure("device creation");
+#endif
         if (error) *error = std::string("SDL_CreateGPUDevice: ") + SDL_GetError();
         return false;
     }
+#ifdef __ANDROID__
+    depthFormat_ = SDL_GPU_TEXTUREFORMAT_INVALID;
+    for (auto format : {SDL_GPU_TEXTUREFORMAT_D32_FLOAT, SDL_GPU_TEXTUREFORMAT_D24_UNORM, SDL_GPU_TEXTUREFORMAT_D16_UNORM}) {
+        if (!SDL_GPUTextureSupportsFormat(dev_, format, SDL_GPU_TEXTURETYPE_2D, SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET))
+            continue;
+        depthFormat_ = format;
+        break;
+    }
+#endif
     if (!desc.offscreen) {
         const SDL_PropertiesID props = SDL_GetGPUDeviceProperties(dev_);
         char info[256];
@@ -394,6 +415,9 @@ bool SdlGpuDevice::Init(const GpuDeviceDesc& desc, std::string* error) {
     }
     if (window_) {
         if (!SDL_ClaimWindowForGPUDevice(dev_, window_)) {
+#ifdef __ANDROID__
+            LogVulkanStartupFailure("window surface");
+#endif
             if (error) *error = std::string("SDL_ClaimWindowForGPUDevice: ") + SDL_GetError();
             window_ = nullptr;
             return false;
@@ -401,27 +425,64 @@ bool SdlGpuDevice::Init(const GpuDeviceDesc& desc, std::string* error) {
         capabilities_.tearing = SDL_WindowSupportsGPUPresentMode(dev_, window_, SDL_GPU_PRESENTMODE_IMMEDIATE);
         capabilities_.lowLatency = true; // SDL's allowed-frames API is a required device operation.
         SDL_GPUPresentMode mode = SelectPresentMode(graphics_);
+#ifdef __ANDROID__
+        // SDL initially claims the window in SDR/FIFO. A driver may advertise
+        // Mailbox and still fail to create that swapchain for this surface.
+        if (mode != SDL_GPU_PRESENTMODE_VSYNC && !SDL_SetGPUSwapchainParameters(dev_, window_, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+            std::fprintf(stderr, "Vulkan retry: FIFO presentation\n");
+            mode = SDL_GPU_PRESENTMODE_VSYNC;
+            if (!SDL_SetGPUSwapchainParameters(dev_, window_, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
+                LogVulkanStartupFailure("swapchain");
+                if (error) *error = std::string("SDL swap chain: ") + SDL_GetError();
+                return false;
+            }
+        }
+#else
         if (!SDL_SetGPUSwapchainParameters(dev_, window_, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, mode)) {
             if (error) *error = std::string("SDL swap chain: ") + SDL_GetError();
             return false;
         }
+#endif
         if (mode == SDL_GPU_PRESENTMODE_VSYNC) graphics_.syncInterval = sync_ = 1;
         presentMode_ = mode;
     }
+#ifdef __ANDROID__
+    if (depthFormat_ == SDL_GPU_TEXTUREFORMAT_INVALID) {
+        LogVulkanStartupFailure("depth format");
+        if (error) *error = "No compatible Vulkan depth attachment format";
+        return false;
+    }
+    const char* depthName = depthFormat_ == SDL_GPU_TEXTUREFORMAT_D32_FLOAT ? "D32" :
+                            depthFormat_ == SDL_GPU_TEXTUREFORMAT_D24_UNORM ? "D24" : "D16";
+    std::fprintf(stderr, "Vulkan device: %s driver, %s depth, anisotropy %s\n", custom ? "custom" : "system",
+                 depthName, capabilities_.maxAnisotropy > 1 ? "on" : "off");
+#endif
     int w = desc.width, h = desc.height;
     if (follow_) SDL_GetWindowSizeInPixels(window_, &w, &h);
-    if (!CreateShaders(error)) return false;
-    if (!CreatePresentPipeline(error)) return false;
+    if (!CreateShaders(error)) {
+#ifdef __ANDROID__
+        LogVulkanStartupFailure("shaders");
+#endif
+        return false;
+    }
+    if (!CreatePresentPipeline(error)) {
+#ifdef __ANDROID__
+        LogVulkanStartupFailure("present pipeline");
+#endif
+        return false;
+    }
     if (!CreateTargets(w, h)) {
+#ifdef __ANDROID__
+        LogVulkanStartupFailure("render targets");
+#endif
         if (error) *error = std::string("SDL_GPU targets: ") + SDL_GetError();
         return false;
     }
     auto supports = [this](SDL_GPUSampleCount samples) {
         return SDL_GPUTextureSupportsSampleCount(dev_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, samples) &&
-               SDL_GPUTextureSupportsSampleCount(dev_, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, samples);
+               SDL_GPUTextureSupportsSampleCount(dev_, depthFormat_, samples);
     };
     capabilities_.msaa2 = supports(SDL_GPU_SAMPLECOUNT_2); capabilities_.msaa4 = supports(SDL_GPU_SAMPLECOUNT_4);
-    capabilities_.maxAnisotropy = 16;
 #ifdef HOTD2_SDL_GPU_SPIRV
     capabilities_.materialMaps = true;
 #else
@@ -438,12 +499,19 @@ bool SdlGpuDevice::Init(const GpuDeviceDesc& desc, std::string* error) {
     white.pixels = { 255, 255, 255, 255 };
     const GpuTexture t = CreateTexture(white);
     if (!t) {
+#ifdef __ANDROID__
+        LogVulkanStartupFailure("default texture");
+#endif
         if (error) *error = std::string("SDL_GPU texture: ") + SDL_GetError();
         return false;
     }
     white_ = textures_[t - 1];
     textures_.pop_back();
-    return CreatePostPipelines(error);
+    if (CreatePostPipelines(error)) return true;
+#ifdef __ANDROID__
+    LogVulkanStartupFailure("post-processing resources");
+#endif
+    return false;
 }
 
 bool SdlGpuDevice::CreateShaders(std::string* error) {
@@ -585,10 +653,15 @@ bool SdlGpuDevice::CreatePresentPipeline(std::string* error) {
     pi.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;  // one full-viewport triangle from SV_VertexID, no vertex buffer
     pi.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
     pi.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    pi.rasterizer_state.enable_depth_clip = true;
     pi.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
     pi.target_info.color_target_descriptions = &ct;
     pi.target_info.num_color_targets = 1;
     presentPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
+    if (!presentPipe_) {
+        if (error) *error = std::string("SDL_GPU present pipeline: ") + SDL_GetError();
+        return false;
+    }
 #ifdef HOTD2_SDL_GPU_SPIRV
     pi.fragment_shader = plainPresentPs_;
     plainPresentPipe_ = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
@@ -602,8 +675,8 @@ bool SdlGpuDevice::CreatePresentPipeline(std::string* error) {
     si.mipmap_mode = SDL_GPU_SAMPLERMIPMAPMODE_NEAREST;
     si.address_mode_u = si.address_mode_v = si.address_mode_w = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
     presentSampler_ = SDL_CreateGPUSampler(dev_, &si);
-    if (!presentPipe_ || !presentSampler_) {
-        if (error) *error = std::string("SDL_GPU present pipeline: ") + SDL_GetError();
+    if (!presentSampler_) {
+        if (error) *error = std::string("SDL_GPU present sampler: ") + SDL_GetError();
         return false;
     }
     return true;
@@ -659,7 +732,7 @@ bool SdlGpuDevice::EnsurePostTarget(PostTarget& target,int w,int h,SDL_GPUTextur
 bool SdlGpuDevice::EnsureDepthTargets() {
     if(opaqueDepth_&&opaqueWidth_==width_&&opaqueHeight_==height_)return true;
     if(!EnsurePostTarget(opaqueDepthColor_,width_,height_,SDL_GPU_TEXTUREFORMAT_R32_FLOAT))return false;
-    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=depthFormat_;
     info.usage=SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;info.width=width_;info.height=height_;
     info.layer_count_or_depth=info.num_levels=1;info.sample_count=SDL_GPU_SAMPLECOUNT_1;
     auto* texture=SDL_CreateGPUTexture(dev_,&info);if(!texture)return false;
@@ -681,7 +754,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::DepthPipeline(const GpuState& state) {
     info.depth_stencil_state.enable_depth_test=info.depth_stencil_state.enable_depth_write=true;
     info.depth_stencil_state.compare_op=static_cast<SDL_GPUCompareOp>(ReversedDepthCompare(state.zfunc));
     info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;
-    info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;info.target_info.has_depth_stencil_target=true;
+    info.target_info.depth_stencil_format=depthFormat_;info.target_info.has_depth_stencil_target=true;
     auto* pipeline=SDL_CreateGPUGraphicsPipeline(dev_,&info);if(pipeline)depthPipelines_[key]=pipeline;return pipeline;
 }
 
@@ -709,7 +782,7 @@ bool SdlGpuDevice::EnsureMotionTargets() {
     if(motionDepth_&&motionWidth_==width_&&motionHeight_==height_)return true;
     if(!EnsurePostTarget(motionColor_,width_,height_,SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT)||
        !EnsurePostTarget(previousDepthColor_,width_,height_,SDL_GPU_TEXTUREFORMAT_R32_FLOAT))return false;
-    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=depthFormat_;
     info.usage=SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;info.width=width_;info.height=height_;
     info.layer_count_or_depth=info.num_levels=1;info.sample_count=SDL_GPU_SAMPLECOUNT_1;
     auto* next=SDL_CreateGPUTexture(dev_,&info);if(!next)return false;
@@ -731,7 +804,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::MotionPipeline(const GpuState& state) {
     info.depth_stencil_state.enable_depth_test=info.depth_stencil_state.enable_depth_write=true;
     info.depth_stencil_state.compare_op=static_cast<SDL_GPUCompareOp>(ReversedDepthCompare(state.zfunc));
     info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;
-    info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;info.target_info.has_depth_stencil_target=true;
+    info.target_info.depth_stencil_format=depthFormat_;info.target_info.has_depth_stencil_target=true;
     auto* next=SDL_CreateGPUGraphicsPipeline(dev_,&info);if(next)motionPipelines_[key]=next;return next;
 }
 
@@ -784,7 +857,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::ReactivePipeline(GpuDraw::Pipeline kind,c
     info.depth_stencil_state.enable_depth_test=true;info.depth_stencil_state.enable_depth_write=false;
     info.depth_stencil_state.compare_op=static_cast<SDL_GPUCompareOp>(ReversedDepthCompare(state.zfunc));
     info.target_info.color_target_descriptions=&target;info.target_info.num_color_targets=1;
-    info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;info.target_info.has_depth_stencil_target=true;
+    info.target_info.depth_stencil_format=depthFormat_;info.target_info.has_depth_stencil_target=true;
     auto* pipeline=SDL_CreateGPUGraphicsPipeline(dev_,&info);if(pipeline)reactivePipelines_[key]=pipeline;return pipeline;
 }
 
@@ -1004,7 +1077,7 @@ bool SdlGpuDevice::CreateTargets(int w, int h, int samples) {
         ti.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
         multisample = SDL_CreateGPUTexture(dev_, &ti);
     }
-    ti.format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    ti.format = depthFormat_;
     ti.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;
     depth = SDL_CreateGPUTexture(dev_, &ti);
     if (!window_) {
@@ -1064,11 +1137,12 @@ bool SdlGpuDevice::ConfigureGraphics(const GraphicsOptions& requested, std::stri
     if (options.lowLatency && !capabilities_.lowLatency) { if (error) *error = "Low latency presentation is unavailable on this device"; return false; }
     const auto samples = options.msaa == 4 ? SDL_GPU_SAMPLECOUNT_4 : options.msaa == 2 ? SDL_GPU_SAMPLECOUNT_2 : SDL_GPU_SAMPLECOUNT_1;
     if (!SDL_GPUTextureSupportsSampleCount(dev_, SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, samples) ||
-        !SDL_GPUTextureSupportsSampleCount(dev_, SDL_GPU_TEXTUREFORMAT_D32_FLOAT, samples)) {
+        !SDL_GPUTextureSupportsSampleCount(dev_, depthFormat_, samples)) {
         if (error) *error = "Requested MSAA sample count is unavailable on this device";
         return false;
     }
     GraphicsOptions effective = options;
+    effective.anisotropy = std::min(effective.anisotropy, capabilities_.maxAnisotropy);
     const auto mode = window_ ? SelectPresentMode(options) : presentMode_;
     const auto composition=options.hdrOutput?SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR:SDL_GPU_SWAPCHAINCOMPOSITION_SDR;
     const auto previousComposition=graphics_.hdrOutput?SDL_GPU_SWAPCHAINCOMPOSITION_HDR_EXTENDED_LINEAR:SDL_GPU_SWAPCHAINCOMPOSITION_SDR;
@@ -1298,7 +1372,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::Pipeline(GpuDraw::Pipeline kind, const Gp
     pi.depth_stencil_state.compare_op = static_cast<SDL_GPUCompareOp>(ReversedDepthCompare(s.zfunc));
     pi.target_info.color_target_descriptions = &ct;
     pi.target_info.num_color_targets = 1;
-    pi.target_info.depth_stencil_format = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    pi.target_info.depth_stencil_format = depthFormat_;
     pi.target_info.has_depth_stencil_target = true;
     SDL_GPUGraphicsPipeline* p = SDL_CreateGPUGraphicsPipeline(dev_, &pi);
     if (p) pipelines_[key] = p;
@@ -1665,8 +1739,27 @@ void SdlGpuDevice::DrawPresent(SDL_GPUTexture* target, int x, int y, int w, int 
 
 std::unique_ptr<GpuDevice> CreateSdlGpuDevice(const GpuDeviceDesc& desc, std::string* error) {
     auto d = std::make_unique<SdlGpuDevice>();
-    if (!d->Init(desc, error)) return nullptr;
-    return d;
+    if (d->Init(desc, error)) return d;
+#ifdef __ANDROID__
+    if (const char* state = SDL_GetHint("HOTD2_VULKAN_DRIVER_STATE")) {
+        // A custom driver can create a device but fail at a later step, such as
+        // attaching to the Android surface. Release it before loading the system driver.
+        d.reset();
+        std::fprintf(stderr, "Vulkan retry: system driver\n");
+        if (FILE* file = std::fopen(state, "w")) {
+            std::fprintf(file, "failed\n%s\n", error ? error->c_str() : "Vulkan initialization failed");
+            std::fclose(file);
+        }
+        SDL_ResetHint("HOTD2_VULKAN_DRIVER_STATE");
+        SDL_ResetHint(SDL_HINT_VULKAN_LIBRARY);
+        d = std::make_unique<SdlGpuDevice>();
+        if (d->Init(desc, error)) {
+            if (error) error->clear();
+            return d;
+        }
+    }
+#endif
+    return nullptr;
 }
 
 }  // namespace port

@@ -3,7 +3,7 @@ bool SdlGpuDevice::EnsureShadowMap(int quality) {
     if(quality<1||quality>3)return false;const int size=1024<<(quality-1);
     if(shadowMapColor_.width==size&&shadowMapDepth_)return true;
     PostTarget color;if(!EnsurePostTarget(color,size,size,SDL_GPU_TEXTUREFORMAT_R32_FLOAT))return false;
-    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    SDL_GPUTextureCreateInfo info{};info.type=SDL_GPU_TEXTURETYPE_2D;info.format=depthFormat_;
     info.usage=SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;info.width=info.height=size;info.layer_count_or_depth=info.num_levels=1;info.sample_count=SDL_GPU_SAMPLECOUNT_1;
     auto* depth=SDL_CreateGPUTexture(dev_,&info);
     if(!depth){SDL_ReleaseGPUTexture(dev_,color.texture);return false;}
@@ -23,7 +23,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::ShadowMapPipeline(int cull) {
     info.rasterizer_state.fill_mode=SDL_GPU_FILLMODE_FILL;info.rasterizer_state.front_face=SDL_GPU_FRONTFACE_CLOCKWISE;info.rasterizer_state.enable_depth_clip=true;
     info.rasterizer_state.cull_mode=cull==1?SDL_GPU_CULLMODE_NONE:cull==2?SDL_GPU_CULLMODE_FRONT:SDL_GPU_CULLMODE_BACK;
     info.depth_stencil_state.enable_depth_test=info.depth_stencil_state.enable_depth_write=true;info.depth_stencil_state.compare_op=SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
-    info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;info.target_info.has_depth_stencil_target=true;
+    info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;info.target_info.depth_stencil_format=depthFormat_;info.target_info.has_depth_stencil_target=true;
     shadowMapPipelines_[index]=SDL_CreateGPUGraphicsPipeline(dev_,&info);return shadowMapPipelines_[index];
 }
 

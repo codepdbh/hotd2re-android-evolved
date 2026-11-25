@@ -9,13 +9,14 @@ bool SdlGpuDevice::EnsureHudTargets(std::string* error) {
         SDL_GPUGraphicsPipelineCreateInfo info{};info.vertex_shader=presentVs_;info.fragment_shader=presentPs_;
         info.primitive_type=SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;info.rasterizer_state.fill_mode=SDL_GPU_FILLMODE_FILL;
         info.rasterizer_state.cull_mode=SDL_GPU_CULLMODE_NONE;info.multisample_state.sample_count=SDL_GPU_SAMPLECOUNT_1;
+        info.rasterizer_state.enable_depth_clip=true;
         info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;
-        info.target_info.has_depth_stencil_target=true;info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+        info.target_info.has_depth_stencil_target=true;info.target_info.depth_stencil_format=depthFormat_;
         hudCopyPipeline_=SDL_CreateGPUGraphicsPipeline(dev_,&info);
         if(!hudCopyPipeline_){if(error)*error=SDL_GetError();return false;}
     }
     if(hudColor_.texture&&hudDepth_&&hudColor_.width==width&&hudColor_.height==height)return true;
-    PostTarget color;SDL_GPUTextureCreateInfo depth{};depth.type=SDL_GPU_TEXTURETYPE_2D;depth.format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+    PostTarget color;SDL_GPUTextureCreateInfo depth{};depth.type=SDL_GPU_TEXTURETYPE_2D;depth.format=depthFormat_;
     depth.usage=SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET;depth.width=width;depth.height=height;depth.layer_count_or_depth=1;
     depth.num_levels=1;depth.sample_count=SDL_GPU_SAMPLECOUNT_1;
     if(!EnsurePostTarget(color,width,height)){if(error)*error=SDL_GetError();return false;}

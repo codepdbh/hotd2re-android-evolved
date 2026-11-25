@@ -24,7 +24,7 @@ SDL_GPUGraphicsPipeline* SdlGpuDevice::ReflectionSurfacePipeline(const GpuState&
     info.rasterizer_state.cull_mode=state.cull<=1?SDL_GPU_CULLMODE_NONE:state.cull==2?SDL_GPU_CULLMODE_FRONT:SDL_GPU_CULLMODE_BACK;
     info.depth_stencil_state.enable_depth_test=true;info.depth_stencil_state.enable_depth_write=false;
     info.depth_stencil_state.compare_op=static_cast<SDL_GPUCompareOp>(ReversedDepthCompare(state.zfunc));
-    info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;info.target_info.depth_stencil_format=SDL_GPU_TEXTUREFORMAT_D32_FLOAT;info.target_info.has_depth_stencil_target=true;
+    info.target_info.color_target_descriptions=&color;info.target_info.num_color_targets=1;info.target_info.depth_stencil_format=depthFormat_;info.target_info.has_depth_stencil_target=true;
     auto* pipeline=SDL_CreateGPUGraphicsPipeline(dev_,&info);if(pipeline)reflectionSurfacePipelines_[key]=pipeline;return pipeline;
 }
 

@@ -58,6 +58,14 @@ El 23 de noviembre de 2026, el Redmi Note 8 con Adreno 610 presentó entre 3 y 5
 
 La APK final firmada quedó instalada con **Ancho del teléfono**, **Original (480p)** y **PC (rendimiento)**. El motor confirmó un render interno de 1040 × 480. Las muestras de la primera fase dieron entre 54,4 y 60 FPS. En combate, las muestras de 60 fotogramas durante el disparo y la recarga dieron 60 FPS, con percentil 95 de 16,9 ms o menos. La recarga devolvió la munición de cinco a seis y los controles táctiles pausaron y reanudaron la partida. El lanzador conservó los ajustes al volver desde el juego.
 
+## Compatibilidad de Vulkan en Android
+
+El 25 de noviembre de 2026, cuatro informes de Android 1.1 mostraron un fallo genérico al iniciar el renderizador. El informe restante registró la importación y no incluye un intento de arranque. Los registros de 1.1 no identifican cuál requisito de Vulkan falló. [Incidencias de Android Evolved](https://github.com/codepdbh/hotd2re-android-evolved/issues)
+
+Las APK ARM64 y ARMv7 compilaron y pasaron la verificación de firma v3. El Galaxy S25 arrancó con el driver del sistema, profundidad D32 y filtrado anisotrópico. Una compilación de prueba forzó el segundo intento sin anisotropía y seleccionó D16. En ese mismo teléfono se comprobó el menú 3D y la introducción de la primera fase. La variante ARMv7 y los modelos de las incidencias quedan pendientes de pruebas físicas.
+
+La vista previa del informe en el S25 mostró el ABI, la versión Vulkan declarada por Android y los parámetros del dispositivo gráfico. Pasaron 20 casos del filtro, incluidos mensajes de reintento y fallos de arranque con rutas privadas, direcciones y códigos que el informe debe omitir.
+
 ### Optimizaciones y drivers personalizados
 
 El 23 de noviembre de 2026 se midió la demo de la primera fase en el Redmi Note 8 (Adreno 610, Android 16) con **Ancho del teléfono** y **Original (480p)**, render interno de 1040 × 480:

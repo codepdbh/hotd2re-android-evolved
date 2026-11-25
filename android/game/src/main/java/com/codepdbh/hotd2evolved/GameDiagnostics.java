@@ -3,6 +3,7 @@ package com.codepdbh.hotd2evolved;
 import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
 import android.content.Context;
+import android.content.pm.FeatureInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.util.Log;
@@ -28,6 +29,12 @@ final class GameDiagnostics {
             "HOTD2RE [0-9.]{1,12} \\(build [0-9 A-Z]{1,24}\\)"
             + "|play: renderer [A-Za-z0-9_-]{1,24}(?:, input [A-Za-z0-9_ /-]{1,60})?"
             + "|Low latency audio enabled"
+            + "|Android render target: [0-9]{1,5}x[0-9]{1,5}, graphics: (?:PC|NAOMI)"
+            + "|Vulkan device: (?:custom|system) driver, D(?:16|24|32) depth, anisotropy (?:on|off)"
+            + "|Vulkan retry: (?:anisotropic filtering disabled|FIFO presentation|system driver)"
+            + "|Vulkan startup failed: (?:device creation|depth format|window surface|swapchain|shaders|present pipeline"
+            + "|render targets|default texture|post-processing resources)"
+            + "|Renderer startup failed: model resources"
             + "|Native main returned -?[0-9]{1,10}"
             + "|netplay: cannot create a UDP socket"
             + "|netplay: DESYNC at frame [0-9]{1,10} \\(ours [A-F0-9]{8}, theirs [A-F0-9]{8}\\); gameplay halted"
@@ -56,6 +63,8 @@ final class GameDiagnostics {
         StringBuilder report = new StringBuilder("### Android diagnostics\n\n```");
         report.append("\nApp: ").append(version).append("\nDevice model: ").append(Build.MODEL)
                 .append("\nAndroid API: ").append(Build.VERSION.SDK_INT)
+                .append("\nApp ABI: ").append(android.os.Process.is64Bit() ? "64-bit" : "32-bit")
+                .append("\nSystem Vulkan: ").append(declaredVulkanVersion(context.getPackageManager()))
                 .append("\nGame data present: ").append(GameDataImport.available(files.resolve("game")));
         String abnormalExit = recentAbnormalExit(context);
         if (abnormalExit != null) report.append("\nRecent abnormal exit: ").append(abnormalExit);
@@ -67,8 +76,18 @@ final class GameDiagnostics {
             if (line != null) engine.add(line);
         }
         appendRecent(report, "Launcher", launcher, 5);
-        appendRecent(report, "Engine", engine, 8);
+        appendRecent(report, "Engine", engine, 12);
         return report.append("\n```").toString();
+    }
+
+    private static String declaredVulkanVersion(PackageManager packages) {
+        for (FeatureInfo feature : packages.getSystemAvailableFeatures()) {
+            if ("android.hardware.vulkan.version".equals(feature.name)) {
+                int version = feature.version;
+                return ((version >>> 22) & 0x7f) + "." + ((version >>> 12) & 0x3ff) + "." + (version & 0xfff);
+            }
+        }
+        return "not declared";
     }
 
     private static String normalizeEngineLine(String line) {

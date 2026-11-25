@@ -1,6 +1,6 @@
 # The House of the Dead 2 — Android Evolved
 
-[Español](#español) · [English](#english) · [APK de la versión 1.1 / Version 1.1 APK](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.1)
+[Español](#español) · [English](#english) · [APK de la versión 1.2 / Version 1.2 APK](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.2)
 
 ## Español
 
@@ -26,7 +26,7 @@ Copia completas las carpetas indicadas. Si tu instalación contiene `Hod2.ini`, 
 
 ### Instala y juega
 
-1. Descarga `HOTD2RE-Android-Evolved-v1.1-arm64.apk` en [GitHub Releases](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.1). Abre la APK y, si Android lo solicita, permite instalar apps desde la aplicación con la que abriste el archivo.
+1. Descarga `HOTD2RE-Android-Evolved-v1.2-arm64.apk` en [GitHub Releases](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.2). Abre la APK y, si Android lo solicita, permite instalar apps desde la aplicación con la que abriste el archivo.
 2. Espera a que termine la transferencia por USB. En el lanzador, toca **Importar carpeta del juego → Memoria interna → h2evolved → Usar esta carpeta**. `Hod2.exe` y las carpetas deben estar directamente dentro de `h2evolved`.
 3. Cuando aparezca **Listos para jugar**, puedes elegir el idioma del lanzador y el formato de pantalla en **Configuración**. Pulsa **Jugar** para iniciar o **Online** para entrar a las salas.
 
@@ -60,7 +60,7 @@ Copy each listed folder in full. If your installation has `Hod2.ini`, put it bes
 
 ### Install and play
 
-1. Download `HOTD2RE-Android-Evolved-v1.1-arm64.apk` from [GitHub Releases](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.1). Open the APK and, if Android prompts you, allow installs from the app you used to open the file.
+1. Download `HOTD2RE-Android-Evolved-v1.2-arm64.apk` from [GitHub Releases](https://github.com/codepdbh/hotd2re-android-evolved/releases/tag/v1.2). Open the APK and, if Android prompts you, allow installs from the app you used to open the file.
 2. Wait for the USB transfer to finish. In the launcher, tap **Import game folder → Internal storage → h2evolved → Use this folder**. Put `Hod2.exe` and the data folders directly inside `h2evolved`.
 3. Once the launcher says **Ready to play**, choose your launcher language and display format in **Settings**. Tap **Play** to start the game or **Online** to open the lobby.
 

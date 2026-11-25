@@ -1490,7 +1490,14 @@ int main(int argc, char** argv) {
         common.renderer, platform::DefaultRenderer(), !explicitRuntimeRenderer,
         [&](platform::Renderer choice, std::string* failure) { return plat.CreateGpu(choice, renderW, renderH, false, 0, failure); },
         &startupRendererFallback, &err, &displayNotice);
-    if (!gpu || !renderer.Init(gpu.get(), &err)) {
+    if (!gpu) {
+        fprintf(stderr, "renderer: %s\n", err.c_str());
+        return 1;
+    }
+    if (!renderer.Init(gpu.get(), &err)) {
+#ifdef __ANDROID__
+        fprintf(stderr, "Renderer startup failed: model resources\n");
+#endif
         fprintf(stderr, "renderer: %s\n", err.c_str());
         return 1;
     }
